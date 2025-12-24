@@ -6,7 +6,7 @@ edition = "2024"
 [dependencies]
 actix-web = "4"
 serde = "1.0.228"
-sqlx = { version = "0.7", features = ["sqlite", "runtime-tokio-native-tls", "macros"] }
+sqlx = { version = "0.8", features = ["sqlite", "runtime-tokio-native-tls", "macros"] }
 tokio = { version = "1.37", features = ["full"]}
 futures-util = "0.3.31"
 uuid = { version = "1.7", features = ["v4", "serde"] }
