@@ -1,0 +1,19 @@
+[package]
+name = "messages"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+actix-web = "4"
+serde = "1.0.228"
+sqlx = { version = "0.7", features = ["sqlite", "runtime-tokio-native-tls", "macros"] }
+tokio = { version = "1.37", features = ["full"]}
+futures-util = "0.3.31"
+uuid = { version = "1.7", features = ["v4", "serde"] }
+rand = "0.8"
+base64 = "0.22.1"
+serde_json = "1.0.145"
+anyhow = "1"
+sha2 = "0.10.9"
+chrono = { version = "0.4", features = ["serde"] }
+auth_middleware = {git="https://github.com/Austin-rgb/auth_middleware.git"}
