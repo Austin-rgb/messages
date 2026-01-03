@@ -2,9 +2,7 @@ use serde::{Deserialize, Serialize};
 use actix::Addr;
 use sqlx::{SqlitePool,FromRow};
 use crate::ws::ChatServer;
-fn default_limit() -> i64 {
-    50
-}
+
 
 pub struct AppState {
     pub db: SqlitePool,
@@ -18,11 +16,33 @@ pub struct MessageResponse {
     pub source: String,
     pub text: String,
     pub created: i64,
+    pub reply_to: Option<i64>,
+}
+
+#[derive(Deserialize)]
+pub struct MessageFilters {
+    pub source: Option<String>,
+    pub text: Option<String>,
+    pub created: Option<i64>,
+    pub reply_to: Option<i64>,
+    pub limit: Option<i32>,   // max items per page
+    pub offset: Option<i32>,  // items to skip
+}
+
+impl MessageFilters{
+    pub fn limit(&self) -> i32 {
+        self.limit.unwrap_or(20) // default 20 items
+    }
+
+    pub fn offset(&self) -> i32 {
+        self.offset.unwrap_or(0) // default start from 0
+    }
 }
 
 #[derive(Deserialize)]
 pub struct CreateMessage {
     pub text: String,     // message content
+    pub reply_to: Option<i64>,
 }
 #[derive(Serialize, FromRow)]
 pub struct ConversationListItem {
@@ -81,12 +101,4 @@ pub struct Participant {
 #[derive(Deserialize)]
 pub struct ConversationQuery {
     user: String,
-}
-
-#[derive(Deserialize)]
-pub struct GetMessagesQuery {
-    #[serde(default = "default_limit")]
-    pub limit: i64,
-    #[serde(default)]
-    pub before: Option<i64>,
 }

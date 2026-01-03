@@ -15,7 +15,7 @@ use crate::models::{
     CreateMessage, 
     ConversationResponse, 
     ConversationListItem, 
-    GetMessagesQuery, 
+    MessageFilters, 
     Participant
 };
 
@@ -83,10 +83,7 @@ let exists: Option<ConversationResponse> = query_as::<_, ConversationResponse>("
     .fetch_optional(&mut *tx)
     .await
     .unwrap(); // handle error properly in real code
-
-if exists.is_some() {
-    return HttpResponse::Ok().json(exists)
-}
+    
 
     // 1️⃣ Create conversation (admin = creator)
     let name = payload
@@ -216,40 +213,31 @@ claims:web::ReqData<Claims>,
     payload: web::Json<CreateMessage>,
 ) -> impl Responder {
     let conversation_name = path.into_inner();
-
     
-
     // validate that participation and conversation exists
-    let participants:Vec<Participant> = repositories::Participant::retrieve(&state.db, &conversation_name).await.expect("failed to fetch participants");
-let mut allowed = false;
-    for participant in &participants{
-        if &claims.sub==&participant.participant{
-            allowed = true;
-            break
-        }
-    }
-
-    if !allowed {
-        return HttpResponse::Forbidden()
-        .body("Not a participant in this conversation");
+    let participants:Vec<Participant> = repositories::Participant::retrieve(&state.db, &conversation_name, 1000, 0).await.expect("failed to fetch participants");
+    if !participants.iter().any(|p| p.participant == claims.sub) {
+        return HttpResponse::Forbidden().body("Not a participant in this conversation");
     }
     
-
     // Insert message
-    let result = repositories::Message::insert(&state.db, &conversation_name, &claims.sub, &payload.text);
+    let result = repositories::Message::insert(&state.db, &conversation_name, &claims.sub, &payload.text, &payload.reply_to);
 
     match result.await {
         Ok(message) =>{
             let bus = state.chat_server.clone();
             let msg_clone = message.clone();
+            let source = message.source.clone();
             let participant_ids: Vec<String> = participants.iter().map(|p| p.participant.clone()).collect();
             actix::spawn(async move {
             let payload = serde_json::to_string(&msg_clone).expect("serialization failed");
             for participant in participant_ids {
-                bus.do_send(DeliverMessage {
+                if participant != source {
+                    bus.do_send(DeliverMessage {
                     to: participant,
                     payload: payload.clone(),
                 });
+                }
             }
             }
             );
@@ -270,10 +258,10 @@ async fn get_messages(
     state: web::Data<AppState>,
     claims: web::ReqData<Claims>,
     path: Path<String>,
-    query: web::Query<GetMessagesQuery>,
+    query: web::Query<MessageFilters>,
 ) -> impl Responder {
     let conversation_name = path.into_inner();
-    
+    let query = query.into_inner();
     // Check if user is a participant
     let is_participant: bool = sqlx::query_scalar(
         r#"SELECT EXISTS(
@@ -292,52 +280,28 @@ async fn get_messages(
             .body("Not a participant in this conversation");
     }
     
-    let messages:Vec<MessageResponse> = match query.before {
-        Some(before_id) => {
-            match query_as::<_, MessageResponse>(
-                r#"
-                SELECT id, conversation, source, text, created
-                FROM messages
-                WHERE conversation = ? AND id < ?
-                ORDER BY created DESC
-                LIMIT ?
-                "#
-            )
-            .bind(&conversation_name)
-            .bind(before_id)
-            .bind(query.limit)
-            .fetch_all(&state.db)
-            .await{
-            Ok(msgs) => msgs,
-            Err(e) => {
-                eprintln!("Error fetching messages: {:?}", e);
-                return HttpResponse::InternalServerError().finish();
-            }
-        }
-        }
-        None => {
-            match repositories::Message::retrieve(&state.db,&conversation_name, query.limit).await{
-            Ok(msgs) => msgs,
-            Err(e) => {
-                eprintln!("Error fetching messages: {:?}", e);
-                return HttpResponse::InternalServerError().finish();
-            }
-        }
-        }
-    };
+    let messages:Vec<MessageResponse> = 
+            match repositories::Message::retrieve(&state.db,&conversation_name, query).await{
+                Ok(msgs) => msgs,
+                Err(e) => {
+                    eprintln!("Error fetching messages: {:?}", e);
+                    return HttpResponse::InternalServerError().finish();
+                }
+            };
+    
     let _messages = messages.clone();
-rt::spawn(
+    rt::spawn(
     async move {
         for msg in _messages.iter() {
             repositories::MessageReceipt::create(&state.db,msg.id,&claims.sub).await;
         }
     }
     );
-
     
     HttpResponse::Ok().json(messages)
         
 }
+
 
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
