@@ -4,14 +4,14 @@ use actix_web::{
     web::{Path, scope},
 };
 use auth_middleware::{Auth, Claims};
-use sqlx::{SqlitePool, query, query_as};
 use dotenvy::dotenv;
+use sqlx::{SqlitePool, query, query_as};
 use std::vec::Vec;
 use uuid::Uuid;
+mod logging;
 mod models;
 mod repositories;
 mod ws;
-mod logging;
 use crate::logging::LoggingMiddleware;
 use crate::models::{
     AppState, ConversationListItem, ConversationResponse, CreateConversation, CreateMessage,
@@ -213,22 +213,23 @@ async fn post_message(
     }
 
     // Insert message
-    let result = repositories::Message::insert(
-        &state.db,
-        &conversation_name,
-        &claims.sub,
-        &payload.text,
-        &payload.reply_to,
-    );
+    actix::spawn(async move {
+        let result = repositories::Message::insert(
+            &state.db,
+            &conversation_name,
+            &claims.sub,
+            &payload.text,
+            &payload.reply_to,
+        );
 
-    match result.await {
-        Ok(message) => {
-            let bus = state.chat_server.clone();
-            let msg_clone = message.clone();
-            let source = message.source.clone();
-            let participant_ids: Vec<String> =
-                participants.iter().map(|p| p.participant.clone()).collect();
-            actix::spawn(async move {
+        match result.await {
+            Ok(message) => {
+                let bus = state.chat_server.clone();
+                let msg_clone = message.clone();
+                let source = message.source.clone();
+                let participant_ids: Vec<String> =
+                    participants.iter().map(|p| p.participant.clone()).collect();
+
                 let payload = serde_json::to_string(&msg_clone).expect("serialization failed");
                 for participant in participant_ids {
                     if participant != source {
@@ -238,14 +239,11 @@ async fn post_message(
                         });
                     }
                 }
-            });
-            HttpResponse::Ok().json(message)
+            }
+            Err(e) => eprintln!("Insert message error: {:?}", e),
         }
-        Err(e) => {
-            eprintln!("Insert message error: {:?}", e);
-            HttpResponse::InternalServerError().finish()
-        }
-    }
+    });
+    HttpResponse::Ok().finish()
 }
 
 #[get("/conversations/{name}/messages")]
@@ -335,7 +333,7 @@ async fn main() -> std::io::Result<()> {
     HttpServer::new(move || {
         App::new().app_data(state.clone()).service(
             scope("")
-            .wrap(LoggingMiddleware)
+                .wrap(LoggingMiddleware)
                 .wrap(Auth)
                 .service(create_conversation)
                 .service(get_conversation)
