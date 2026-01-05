@@ -19,7 +19,7 @@ pub struct MessageResponse {
     pub reply_to: Option<i64>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Clone)]
 pub struct MessageFilters {
     pub source: Option<String>,
     pub text: Option<String>,
@@ -66,29 +66,6 @@ pub struct ConversationResponse {
     pub created: i64,
 }
 
-#[derive(FromRow)]
-struct Message {
-    id: i64,
-    source: String,
-    conversation: String,
-    text: String,
-    created: i64,
-}
-
-#[derive(FromRow)]
-struct Conversation {
-    name:String,
-    title:Option<String>,
-    admin: String,
-    created: i64,
-}
-
-#[derive(FromRow)]
-struct DeliveryNote {
-    id: i64,
-    message: i64,
-    dest: String,
-}
 
 #[derive(FromRow)]
 pub struct Participant {
@@ -101,4 +78,12 @@ pub struct Participant {
 #[derive(Deserialize)]
 pub struct ConversationQuery {
     user: String,
+}
+
+#[derive(Serialize, FromRow)]
+pub struct MessageReceipt{
+    user:i64,
+    delivered_at:i64,
+    read_at:i64,
+    reaction:i64
 }

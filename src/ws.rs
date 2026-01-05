@@ -1,11 +1,13 @@
-use actix::{Actor, ActorContext, Context, Handler, Message, Recipient, StreamHandler, AsyncContext};
-use actix_web::{ HttpRequest, HttpResponse, Error, web, get};
+use crate::models::AppState;
+use actix::{
+    Actor, ActorContext, AsyncContext, Context, Handler, Message, Recipient, StreamHandler,
+};
+use actix_web::{Error, HttpRequest, HttpResponse, get, web};
 use actix_web_actors::ws;
+use auth_middleware::Claims;
 use serde::Deserialize;
 use std::collections::HashMap;
-use std::time::{Duration,Instant};
-use auth_middleware::common::Claims;
-use crate::models::AppState;
+use std::time::{Duration, Instant};
 
 #[derive(Message)]
 #[rtype(result = "()")]
@@ -94,7 +96,6 @@ impl Handler<DeliverMessage> for ChatServer {
         }
     }
 }
-
 
 pub struct WsSession {
     user_id: String,
@@ -188,11 +189,10 @@ pub async fn ws_route(
     req: HttpRequest,
     stream: web::Payload,
     state: web::Data<AppState>,
-claims:web::ReqData<Claims>,
+    claims: web::ReqData<Claims>,
 ) -> Result<HttpResponse, Error> {
-    
     let session = WsSession {
-        user_id:claims.sub.clone(),
+        user_id: claims.sub.clone(),
         server: state.get_ref().chat_server.clone(),
         last_heartbeat: Instant::now(),
     };

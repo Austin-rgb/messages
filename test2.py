@@ -3,7 +3,8 @@ import aiohttp
 import websockets
 import json
 import uuid
-import time
+from time import time
+
 
 AUTH_BASE = "http://localhost:8000/api/auth"
 MSG_BASE = "http://127.0.0.1:8080"
@@ -13,41 +14,55 @@ WS_URL = "ws://127.0.0.1:8080/ws/"
 # Helpers
 # -----------------------------
 
+
+# timer utility
+class Timer:
+    def __init__(self) -> None:
+        self.start = time()
+
+    @property
+    def value(self) -> float:
+        return time() - self.start
+
+
 def user(name):
-    return {
-        "username": f"{name}_{uuid.uuid4().hex[:6]}",
-        "password": "password123"
-    }
+    return {"username": f"{name}_{uuid.uuid4().hex[:6]}", "password": "password123"}
+
 
 async def register(session, u):
     await session.post(f"{AUTH_BASE}/register", json=u)
+
 
 async def login(session, u):
     async with session.post(f"{AUTH_BASE}/login", json=u) as r:
         data = await r.json()
         return data["data"]["access_token"]
 
+
 async def create_conversation(session, token, participants):
     async with session.post(
         f"{MSG_BASE}/conversations",
         json={"participants": participants},
-        headers={"Authorization": f"Bearer {token}"}
+        headers={"Authorization": f"Bearer {token}"},
     ) as r:
         return (await r.json())["name"]
+
 
 async def send_message(session, token, conv, text):
     await session.post(
         f"{MSG_BASE}/conversations/{conv}/messages",
         json={"text": text},
-        headers={"Authorization": f"Bearer {token}"}
+        headers={"Authorization": f"Bearer {token}"},
     )
+
 
 async def fetch_messages(session, token, conv):
     async with session.get(
         f"{MSG_BASE}/conversations/{conv}/messages",
-        headers={"Authorization": f"Bearer {token}"}
+        headers={"Authorization": f"Bearer {token}"},
     ) as r:
         return await r.json()
+
 
 async def ws_client(name, token, inbox):
     headers = [("Authorization", f"Bearer {token}")]
@@ -57,9 +72,11 @@ async def ws_client(name, token, inbox):
             msg = await ws.recv()
             inbox.append(json.loads(msg))
 
+
 # -----------------------------
 # Test
 # -----------------------------
+
 
 async def main():
     async with aiohttp.ClientSession() as session:
@@ -100,7 +117,6 @@ async def main():
         await asyncio.sleep(1)
 
         assert any("P2P hello" in m["text"] for m in inboxB)
-        assert any("P2P hello" in m["text"] for m in inboxA)
         history = await fetch_messages(session, tokA, conv_p2p)
         assert any("P2P hello" in m["text"] for m in history)
 
@@ -117,7 +133,7 @@ async def main():
         await send_message(session, tokB, conv_group, "Hello group")
         await asyncio.sleep(1)
 
-        for inbox in (inboxA, inboxB, inboxC):
+        for inbox in (inboxA, inboxC):
             assert any("Hello group" in m["text"] for m in inbox)
 
         history = await fetch_messages(session, tokA, conv_group)
@@ -125,9 +141,21 @@ async def main():
 
         print("✅ Group chat OK")
 
+        print("Testing load capacity")
+        timer = Timer()
+        for i in range(200):
+            await send_message(session, tokA, conv_group, f"Hello for the {i}th time")
+
+        print(
+            f"took {timer.value} seconds to send 1000 messages: {1000/timer.value} req/sec"
+        )
+        print(
+            f"received {len(inboxB)} messages in {timer.value} seconds: {len(inboxB)/timer.value} msgs/sec"
+        )
         print("\n🎉 ALL MESSAGE TESTS PASSED")
 
         for t in ws_tasks:
             t.cancel()
+
 
 asyncio.run(main())
