@@ -1,12 +1,16 @@
-use actix::Actor;
+use actix::{Actor, Addr};
 use actix_web::{
     App, HttpResponse, HttpServer, Responder, get, post, rt, web,
     web::{Path, scope},
 };
 use auth_middleware::{Auth, Claims};
 use dotenvy::dotenv;
+use once_cell::sync::Lazy;
+use redis::{AsyncCommands, Client, RedisResult, Value, aio::Connection, cmd, from_redis_value};
+use serde_json::{from_str, to_string};
 use sqlx::{SqlitePool, query, query_as};
-use std::vec::Vec;
+use std::{collections::HashMap, env, vec::Vec};
+use tokio::sync::{RwLock, mpsc};
 use uuid::Uuid;
 mod logging;
 mod models;
@@ -15,12 +19,108 @@ mod ws;
 use crate::logging::LoggingMiddleware;
 use crate::models::{
     AppState, ConversationListItem, ConversationResponse, CreateConversation, CreateMessage,
-    MessageFilters, MessageResponse, Participant,
+    InsertMessage, MessageFilters, MessageResponse, Participant,
 };
 use crate::repositories::{
     Conversation, Message, MessageReceipt, Participant as PRepo, is_participant,
 };
 use crate::ws::{ChatServer, DeliverMessage, ws_route};
+
+fn create_redis() -> Client {
+    let redis_url = env::var("REDIS").unwrap();
+    Client::open(redis_url).unwrap()
+}
+
+fn deliver_message(msg: &InsertMessage, targets: Vec<String>, bus: Addr<ChatServer>) {
+    let payload = serde_json::to_string(msg).expect("serialization failed");
+    for participant in targets {
+        bus.do_send(DeliverMessage {
+            to: participant.clone(),
+            payload: payload.clone(),
+        });
+    }
+}
+
+async fn ensure_group(conn: &mut Connection) {
+    let res: RedisResult<()> = cmd("XGROUP")
+        .arg("CREATE")
+        .arg("messages_stream")
+        .arg("db_group")
+        .arg("0")
+        .arg("MKSTREAM")
+        .query_async(conn)
+        .await;
+
+    if let Err(err) = res {
+        // BUSYGROUP means the group already exists — safe to ignore
+        if !err.to_string().contains("BUSYGROUP") {
+            panic!("Failed to create group: {err}");
+        }
+    }
+}
+
+async fn db_worker(redis: Client, db: &SqlitePool) {
+    let mut con = redis.get_async_connection().await.unwrap();
+    ensure_group(&mut con).await;
+
+    loop {
+        let streams: Value = cmd("XREADGROUP")
+            .arg("GROUP")
+            .arg("db_group")
+            .arg("worker-1")
+            .arg("COUNT")
+            .arg(50)
+            .arg("BLOCK")
+            .arg(5000)
+            .arg("STREAMS")
+            .arg("messages_stream")
+            .arg(">")
+            .query_async(&mut con)
+            .await
+            .unwrap();
+        let entries = parse_stream(streams);
+        let len = entries.len();
+        if len == 0 {
+            continue;
+        }
+        let msgs: Vec<InsertMessage> = entries
+            .iter()
+            .map(|(a, x)| from_str::<InsertMessage>(x).unwrap())
+            .collect();
+        match Message::insert_many(db, msgs).await {
+            Ok(_) => println!("inserted {} messages", len),
+            Err(e) => println!("insertion failed: {} \n entries: {:?}", e, entries),
+        };
+    }
+}
+
+fn parse_stream(v: Value) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+
+    if let Value::Bulk(streams) = v {
+        for stream in streams {
+            if let Value::Bulk(items) = stream {
+                let entries = &items[1];
+                if let Value::Bulk(entries) = entries {
+                    for entry in entries {
+                        if let Value::Bulk(e) = entry {
+                            let id: String = from_redis_value(&e[0]).unwrap();
+                            let data = &e[1];
+                            if let Value::Bulk(kv) = data {
+                                let payload: String = from_redis_value(&kv[1]).unwrap();
+                                out.push((id, payload));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+static PARTICIPANTS_CACHE: Lazy<RwLock<HashMap<String, Vec<Participant>>>> =
+    Lazy::new(|| RwLock::new(HashMap::new()));
 
 async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
     Message::create_table(db).await;
@@ -112,10 +212,24 @@ async fn create_conversation(
     }
 
     // 3️⃣ Insert other participants (deduplicated)
-    for user in payload.participants.iter().filter(|u| *u != &claims.sub) {
-        if let Err(e) = PRepo::insert(&mut *tx, &conversation.name, user).await {
-            eprintln!("Participant insert error: {:?}", e);
-            return HttpResponse::InternalServerError().finish();
+    let participants: Vec<String> = payload
+        .participants
+        .iter()
+        .filter(|u| *u != &claims.sub)
+        .cloned()
+        .collect();
+
+    // if let Err(e) = PRepo::insert_many(&mut *tx, &conversation.name, participants).await {
+    //     eprintln!("Participant insert error: {:?}", e);
+    //     return HttpResponse::InternalServerError().finish();
+    // }
+    for participant in participants {
+        match PRepo::insert(&mut tx, &conversation.name, &participant).await {
+            Ok(_) => (),
+            Err(_) => {
+                tx.rollback().await.expect("rollback failed");
+                return HttpResponse::InternalServerError().finish();
+            }
         }
     }
 
@@ -202,47 +316,62 @@ async fn post_message(
     payload: web::Json<CreateMessage>,
 ) -> impl Responder {
     let conversation_name = path.into_inner();
-
     // validate that participation and conversation exists
-    let participants: Vec<Participant> =
-        repositories::Participant::retrieve(&state.db, &conversation_name, 1000, 0)
+    let p = PARTICIPANTS_CACHE
+        .read()
+        .await
+        .get(&conversation_name)
+        .cloned();
+    let participants: Vec<Participant> = match p {
+        None => match repositories::Participant::retrieve(&state.db, &conversation_name, 1000, 0)
             .await
-            .expect("failed to fetch participants");
+        {
+            Ok(p) => {
+                PARTICIPANTS_CACHE
+                    .write()
+                    .await
+                    .insert(conversation_name.clone(), p.clone());
+                p
+            }
+            Err(e) => {
+                eprintln!("Error getting participants: {:?}", e);
+                return HttpResponse::InternalServerError().finish();
+            }
+        },
+
+        Some(p) => p,
+    };
+
     if !participants.iter().any(|p| p.participant == claims.sub) {
         return HttpResponse::Forbidden().body("Not a participant in this conversation");
     }
 
     // Insert message
-    actix::spawn(async move {
-        let result = repositories::Message::insert(
-            &state.db,
-            &conversation_name,
-            &claims.sub,
-            &payload.text,
-            &payload.reply_to,
-        );
+    let bus = state.chat_server.clone();
 
-        match result.await {
-            Ok(message) => {
-                let bus = state.chat_server.clone();
-                let msg_clone = message.clone();
-                let source = message.source.clone();
-                let participant_ids: Vec<String> =
-                    participants.iter().map(|p| p.participant.clone()).collect();
-
-                let payload = serde_json::to_string(&msg_clone).expect("serialization failed");
-                for participant in participant_ids {
-                    if participant != source {
-                        bus.do_send(DeliverMessage {
-                            to: participant,
-                            payload: payload.clone(),
-                        });
-                    }
-                }
-            }
-            Err(e) => eprintln!("Insert message error: {:?}", e),
-        }
+    let msg = InsertMessage {
+        source: claims.sub.clone(),
+        conversation: conversation_name,
+        text: payload.text.clone(),
+        reply_to: payload.reply_to,
+    };
+    //let _ = state.writer.send(msg.clone()).await;
+    let mut conn = state.redis.get_async_connection().await.unwrap();
+    let mss = to_string(&msg).unwrap();
+    let res: RedisResult<String> = conn.xadd("messages_stream", "*", &[("payload", mss)]).await;
+    if res.is_err() {
+        return HttpResponse::ServiceUnavailable().finish();
+    }
+    let source = msg.source.clone();
+    let participant_ids: Vec<String> = participants
+        .iter()
+        .map(|p| p.participant.clone())
+        .filter(|p| *p != *source)
+        .collect();
+    rt::spawn(async move {
+        deliver_message(&msg, participant_ids, bus);
     });
+
     HttpResponse::Ok().finish()
 }
 
@@ -328,7 +457,15 @@ async fn main() -> std::io::Result<()> {
 
     init_db(&db).await.expect("DB init failed");
     let chat_server = ChatServer::new().start();
-    let state = web::Data::new(AppState { db, chat_server });
+    let redis = create_redis();
+    let worker_c = redis.clone();
+    let worker_d = db.clone();
+    tokio::spawn(async move { db_worker(worker_c, &worker_d).await });
+    let state = web::Data::new(AppState {
+        db,
+        chat_server,
+        redis,
+    });
 
     HttpServer::new(move || {
         App::new().app_data(state.clone()).service(
@@ -345,6 +482,7 @@ async fn main() -> std::io::Result<()> {
                 .service(ws_route),
         )
     })
+    .workers(12)
     .bind(("127.0.0.1", 8080))?
     .run()
     .await

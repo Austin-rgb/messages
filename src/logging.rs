@@ -1,10 +1,10 @@
-use actix_web::{dev::ServiceRequest, dev::ServiceResponse, Error};
-use actix_web::dev::{Transform, Service};
-use futures::future::{ok, Ready};
+use actix_web::dev::{Service, Transform};
+use actix_web::{Error, dev::ServiceRequest, dev::ServiceResponse};
 use futures::Future;
+use futures::future::{Ready, ok};
 use std::pin::Pin;
-use std::task::{Context, Poll};
 use std::rc::Rc;
+use std::task::{Context, Poll};
 
 // Define the middleware
 pub struct LoggingMiddleware;
@@ -49,7 +49,11 @@ where
         // Capture request info
         let path = req.path().to_string();
         let method = req.method().to_string();
-        let peer_addr = req.connection_info().realip_remote_addr().unwrap_or("unknown").to_string();
+        let peer_addr = req
+            .connection_info()
+            .realip_remote_addr()
+            .unwrap_or("unknown")
+            .to_string();
         let start_time = std::time::Instant::now();
 
         let fut = self.service.call(req);

@@ -1,8 +1,11 @@
 use crate::models::{
-    ConversationResponse, MessageFilters, MessageReceipt as Receipt, MessageResponse,
-    Participant as PModel,
+    ConversationResponse, InsertMessage, MessageFilters, MessageReceipt as Receipt,
+    MessageResponse, Participant as PModel,
 };
-use sqlx::{Error, QueryBuilder, Sqlite, SqliteConnection, SqlitePool, query, query_as};
+use sqlx::{
+    Error, QueryBuilder, Sqlite, SqliteConnection, SqlitePool, query, query_as,
+    sqlite::SqliteQueryResult,
+};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub struct MessageReceipt {}
@@ -14,7 +17,7 @@ fn time_now() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
-        .as_secs() as i64
+        .as_millis() as i64
 }
 
 pub async fn is_participant(db: &SqlitePool, conversation: &String, user: &String) -> bool {
@@ -172,6 +175,22 @@ impl Message {
         .fetch_one(db)
         .await
     }
+    pub async fn insert_many(
+        db: &SqlitePool,
+        msgs: Vec<InsertMessage>,
+    ) -> Result<SqliteQueryResult, Error> {
+        let mut qb = QueryBuilder::<Sqlite>::new(
+            "INSERT INTO messages ( conversation, source, text, created, reply_to)",
+        );
+        qb.push_values(msgs, |mut b, user| {
+            b.push_bind(user.conversation)
+                .push_bind(user.source)
+                .push_bind(user.text)
+                .push_bind(time_now())
+                .push_bind(user.reply_to);
+        });
+        qb.build().execute(db).await
+    }
 }
 
 impl Conversation {
@@ -228,6 +247,27 @@ impl Participant {
         .execute(db)
         .await;
     }
+
+    pub async fn insert_many(
+        tx: &mut SqliteConnection,
+        conversation_name: &String,
+        subjects: Vec<String>,
+    ) -> Result<(), Error> {
+        let created = time_now();
+        let mut qb = QueryBuilder::new(
+            "INSERT OR IGNORE INTO participants (conversation, participant, created) ",
+        );
+
+        qb.push_values(subjects, |mut b, subject| {
+            b.push_bind(conversation_name)
+                .push_bind(subject)
+                .push_bind(created);
+        });
+
+        qb.build().execute(tx).await?;
+        Ok(())
+    }
+
     pub async fn insert(
         tx: &mut SqliteConnection,
         conversation_name: &String,

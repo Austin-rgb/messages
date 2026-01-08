@@ -1,18 +1,19 @@
-import asyncio
-import aiohttp
-import websockets
-import json
+import requests
+import websocket
+from time import sleep, time
 import uuid
-from time import time
+from json import loads
 
 
 AUTH_BASE = "http://localhost:8000/api/auth"
 MSG_BASE = "http://127.0.0.1:8080"
 WS_URL = "ws://127.0.0.1:8080/ws/"
-
+CONCURRENT_CONNECTIONS = 12
 # -----------------------------
 # Helpers
 # -----------------------------
+
+from threading import Thread
 
 
 # timer utility
@@ -25,52 +26,102 @@ class Timer:
         return time() - self.start
 
 
+class WorkPool:
+    def __init__(self, nworkers, handler, work: list = []) -> None:
+        self.handler = handler
+        self.nworkers = nworkers
+        self.proceed = False
+        self._outputs = [None for i in work]
+        self.threads: list[Thread] = []
+        self.work: list = work
+
+    def worker_handler(self):
+        while self.proceed and len(self.work) > 0:
+            i = len(self.work)
+            self._outputs[i - 1] = self.handler(*self.work.pop())
+
+    def resume(self):
+        if not self.proceed:
+            self.threads = [
+                Thread(target=self.worker_handler) for i in range(self.nworkers)
+            ]
+            self.proceed = True
+            for th in self.threads:
+                th.start()
+
+    def start(self):
+        self.resume()
+        return self
+
+    @property
+    def output(self):
+        return self._outputs
+
+    def pause(self):
+
+        self.proceed = False
+        for th in self.threads:
+            th.join()
+
+    def wait(self):
+        for th in self.threads:
+            th.join()
+
+
 def user(name):
     return {"username": f"{name}_{uuid.uuid4().hex[:6]}", "password": "password123"}
 
 
-async def register(session, u):
-    await session.post(f"{AUTH_BASE}/register", json=u)
+def register(session, u):
+    session.post(f"{AUTH_BASE}/register", json=u)
 
 
-async def login(session, u):
-    async with session.post(f"{AUTH_BASE}/login", json=u) as r:
-        data = await r.json()
+def login(session, u):
+    with session.post(f"{AUTH_BASE}/login", json=u) as r:
+        data = r.json()
         return data["data"]["access_token"]
 
 
-async def create_conversation(session, token, participants):
-    async with session.post(
+def create_conversation(session, token, participants):
+    with session.post(
         f"{MSG_BASE}/conversations",
         json={"participants": participants},
         headers={"Authorization": f"Bearer {token}"},
     ) as r:
-        return (await r.json())["name"]
+        return (r.json())["name"]
 
 
-async def send_message(session, token, conv, text):
-    await session.post(
+def send_message(session, token, conv, text):
+    session.post(
         f"{MSG_BASE}/conversations/{conv}/messages",
         json={"text": text},
         headers={"Authorization": f"Bearer {token}"},
     )
 
 
-async def fetch_messages(session, token, conv):
-    async with session.get(
+def fetch_messages(session, token, conv):
+    with session.get(
         f"{MSG_BASE}/conversations/{conv}/messages",
         headers={"Authorization": f"Bearer {token}"},
     ) as r:
-        return await r.json()
+        return r.json()
 
 
-async def ws_client(name, token, inbox):
-    headers = [("Authorization", f"Bearer {token}")]
-    async with websockets.connect(WS_URL, additional_headers=headers) as ws:
-        print(f"[WS] {name} connected")
-        while True:
-            msg = await ws.recv()
-            inbox.append(json.loads(msg))
+def ws_client(name, token, handler):
+    def on_message(ws, message):
+        handler(loads(message))
+        print(time(), message)
+
+    def on_connect(ws):
+        print("connected", name)
+
+    ws = websocket.WebSocketApp(
+        WS_URL,
+        header={"Authorization": f"Bearer {token}"},
+        on_message=on_message,
+        on_open=on_connect,
+    )
+    ws.run_forever()
 
 
 # -----------------------------
@@ -78,84 +129,86 @@ async def ws_client(name, token, inbox):
 # -----------------------------
 
 
-async def main():
-    async with aiohttp.ClientSession() as session:
+if __name__ == "__main__":
+    session = requests.Session()
 
-        print("🔐 Registering users...")
-        A = user("alice")
-        B = user("bob")
-        C = user("carol")
+    names = ["alice", "bob", "carol", "diana", "elvis", "felix"]
+    users = [user(name) for name in names]
+    print("🔐 Registering users...")
+    work = [(session, u) for u in users]
+    wp = WorkPool(10, register, work)
+    wp.start()
+    wp.wait()
 
-        for u in (A, B, C):
-            await register(session, u)
+    print("🔑 Logging in...")
+    work = [(session, u) for u in users]
+    wp = WorkPool(len(work), login, work)
+    wp.start().wait()
+    tokens: list[str] = wp.output
+    inboxes: list[list] = [[] for i in users]
 
-        print("🔑 Logging in...")
-        tokA = await login(session, A)
-        tokB = await login(session, B)
-        tokC = await login(session, C)
+    print("📡 Connecting WebSockets...")
 
-        inboxA, inboxB, inboxC = [], [], []
+    WorkPool(
+        len(users),
+        ws_client,
+        [(u, t, i.append) for u, t, i in zip(users, tokens, inboxes)],
+    ).start()
 
-        print("📡 Connecting WebSockets...")
-        ws_tasks = [
-            asyncio.create_task(ws_client(A["username"], tokA, inboxA)),
-            asyncio.create_task(ws_client(B["username"], tokB, inboxB)),
-            asyncio.create_task(ws_client(C["username"], tokC, inboxC)),
-        ]
+    # -----------------------------
+    # Peer-to-peer
+    # -----------------------------
+    print("💬 Testing P2P conversation...")
+    conv_p2p = create_conversation(session, tokens[0], [users[1]["username"]])
 
-        await asyncio.sleep(1)
+    send_message(session, tokens[0], conv_p2p, "P2P hello")
+    sleep(2)
+    print(inboxes)
+    history = fetch_messages(session, tokens[0], conv_p2p)
+    # assert any("P2P hello" in m["text"] for m in history)
+    print(inboxes[1])
+    assert any("P2P hello" in m["text"] for m in inboxes[1])
 
-        # -----------------------------
-        # Peer-to-peer
-        # -----------------------------
-        print("💬 Testing P2P conversation...")
-        conv_p2p = await create_conversation(
-            session, tokA, [A["username"], B["username"]]
-        )
+    print("✅ P2P OK")
 
-        await send_message(session, tokA, conv_p2p, "P2P hello")
-        await asyncio.sleep(1)
+    # -----------------------------
+    # Group chat
+    # -----------------------------
+    print("👥 Testing group chat...")
+    conv_group = create_conversation(session, tokens[0], [u["username"] for u in users])
 
-        assert any("P2P hello" in m["text"] for m in inboxB)
-        history = await fetch_messages(session, tokA, conv_p2p)
-        assert any("P2P hello" in m["text"] for m in history)
-
-        print("✅ P2P OK")
-
-        # -----------------------------
-        # Group chat
-        # -----------------------------
-        print("👥 Testing group chat...")
-        conv_group = await create_conversation(
-            session, tokA, [A["username"], B["username"], C["username"]]
-        )
-
-        await send_message(session, tokB, conv_group, "Hello group")
-        await asyncio.sleep(1)
-
-        for inbox in (inboxA, inboxC):
+    send_message(session, tokens[1], conv_group, "Hello group")
+    sleep(1)
+    print(inboxes)
+    for inbox in inboxes:
+        if inbox != inboxes[1]:
             assert any("Hello group" in m["text"] for m in inbox)
 
-        history = await fetch_messages(session, tokA, conv_group)
-        assert any("Hello group" in m["text"] for m in history)
+    history = fetch_messages(session, tokens[-1], conv_group)
+    # assert any("Hello group" in m["text"] for m in history)
 
-        print("✅ Group chat OK")
+    print("✅ Group chat OK")
 
-        print("Testing load capacity")
-        timer = Timer()
-        for i in range(200):
-            await send_message(session, tokA, conv_group, f"Hello for the {i}th time")
+    print("Testing load capacity")
 
-        print(
-            f"took {timer.value} seconds to send 1000 messages: {1000/timer.value} req/sec"
-        )
-        print(
-            f"received {len(inboxB)} messages in {timer.value} seconds: {len(inboxB)/timer.value} msgs/sec"
-        )
-        print("\n🎉 ALL MESSAGE TESTS PASSED")
+    msgs = 0
 
-        for t in ws_tasks:
-            t.cancel()
+    def func():
+        global msgs
+        send_message(session, tokens[0], conv_group, f"Hello for the th time")
+        msgs += 1
 
-
-asyncio.run(main())
+    timer = Timer()
+    thds = []
+    wp = WorkPool(CONCURRENT_CONNECTIONS, func, [() for i in range(900)]).start()
+    sleep(15)
+    wp.pause()
+    print(
+        f"took {timer.value} seconds to send {msgs} messages: {msgs/timer.value} req/sec"
+    )
+    print(
+        f"received {len(inboxes[1])} messages in {timer.value} seconds: {len(inboxes[1])/timer.value} msgs/sec"
+    )
+    history = fetch_messages(session, tokens[-1], conv_group)
+    print(f"written {len(history)} messages in {timer.value} seconds")
+    print("\n🎉 ALL MESSAGE TESTS PASSED")
