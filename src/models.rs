@@ -4,28 +4,20 @@ use redis::Client;
 use serde::{Deserialize, Serialize};
 use sqlx::{FromRow, SqlitePool};
 
-#[derive(Serialize, Clone, Deserialize)]
+#[derive(Serialize, Clone, FromRow, Deserialize)]
 pub struct InsertMessage {
     pub source: String,
     pub conversation: String,
     pub text: String,
     pub reply_to: Option<i64>,
+    pub created: i64,
+    pub id: String,
 }
 
 pub struct AppState {
     pub db: SqlitePool,
     pub chat_server: Addr<ChatServer>,
     pub redis: Client,
-}
-
-#[derive(Serialize, FromRow, Clone)]
-pub struct MessageResponse {
-    pub id: i64,
-    pub conversation: String,
-    pub source: String,
-    pub text: String,
-    pub created: i64,
-    pub reply_to: Option<i64>,
 }
 
 #[derive(Deserialize, Clone)]
@@ -90,8 +82,18 @@ pub struct ConversationQuery {
 
 #[derive(Serialize, FromRow)]
 pub struct MessageReceipt {
-    user: i64,
+    user: String,
     delivered_at: i64,
     read_at: i64,
     reaction: i64,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct Receipt {
+    pub message_id: String,
+    pub user_id: String,
+    pub delivered: bool,
+    pub read: bool,
+    pub reaction: Option<i64>,
+    pub ts: i64,
 }

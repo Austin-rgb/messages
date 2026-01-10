@@ -1,13 +1,19 @@
-use crate::models::AppState;
+use crate::models::{AppState, Receipt};
+use crate::repositories::MessageReceipt;
 use actix::{
     Actor, ActorContext, AsyncContext, Context, Handler, Message, Recipient, StreamHandler,
+    WrapFuture,
 };
 use actix_web::{Error, HttpRequest, HttpResponse, get, web};
 use actix_web_actors::ws;
 use auth_middleware::Claims;
+use futures::executor::block_on;
+use redis::{AsyncCommands, Client};
 use serde::Deserialize;
+use sqlx::SqlitePool;
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
+use uuid::Uuid;
 
 #[derive(Message)]
 #[rtype(result = "()")]
@@ -21,6 +27,7 @@ pub struct Connect {
 pub struct DeliverMessage {
     pub to: String,
     pub payload: String,
+    pub id: String,
 }
 
 #[derive(Message)]
@@ -39,7 +46,10 @@ pub struct PrivateMessage {
 
 #[derive(Message)]
 #[rtype(result = "()")]
-pub struct ServerMessage(pub String);
+pub struct ServerMessage {
+    pub payload: String,
+    id: String,
+}
 
 pub struct ChatServer {
     users: HashMap<String, Recipient<ServerMessage>>,
@@ -82,7 +92,10 @@ impl Handler<PrivateMessage> for ChatServer {
                 "from": msg.from,
                 "content": msg.content
             });
-            let _ = recipient.do_send(ServerMessage(payload.to_string()));
+            let _ = recipient.do_send(ServerMessage {
+                payload: payload.to_string(),
+                id: Uuid::new_v4().to_string(),
+            });
         }
     }
 }
@@ -92,7 +105,10 @@ impl Handler<DeliverMessage> for ChatServer {
 
     fn handle(&mut self, msg: DeliverMessage, _: &mut Context<Self>) {
         if let Some(recipient) = self.users.get(&msg.to) {
-            let _ = recipient.do_send(ServerMessage(msg.payload));
+            let _ = recipient.do_send(ServerMessage {
+                payload: msg.payload,
+                id: msg.id.to_string(),
+            });
         }
     }
 }
@@ -100,6 +116,7 @@ impl Handler<DeliverMessage> for ChatServer {
 pub struct WsSession {
     user_id: String,
     server: actix::Addr<ChatServer>,
+    redis: Client,
     last_heartbeat: Instant,
 }
 
@@ -180,7 +197,31 @@ impl Handler<ServerMessage> for WsSession {
     type Result = ();
 
     fn handle(&mut self, msg: ServerMessage, ctx: &mut Self::Context) {
-        ctx.text(msg.0);
+        ctx.text(msg.payload);
+        let user_id = self.user_id.clone();
+        let redis = self.redis.clone();
+        let msg_id = msg.id.clone();
+        actix::spawn(async move {
+            let mut conn = match redis.get_async_connection().await {
+                Ok(c) => c,
+                Err(_) => return,
+            };
+
+            let event = Receipt {
+                message_id: msg_id,
+                user_id,
+                delivered: true,
+                read: false,
+                reaction: None,
+                ts: chrono::Utc::now().timestamp(),
+            };
+
+            let payload = serde_json::to_string(&event).unwrap();
+
+            let _: redis::RedisResult<String> = conn
+                .xadd("receipts_stream", "*", &[("payload", payload)])
+                .await;
+        });
     }
 }
 
@@ -195,6 +236,7 @@ pub async fn ws_route(
         user_id: claims.sub.clone(),
         server: state.get_ref().chat_server.clone(),
         last_heartbeat: Instant::now(),
+        redis: state.redis.clone(),
     };
 
     ws::start(session, &req, stream)

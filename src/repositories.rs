@@ -1,19 +1,21 @@
 use crate::models::{
     ConversationResponse, InsertMessage, MessageFilters, MessageReceipt as Receipt,
-    MessageResponse, Participant as PModel,
+    Participant as PModel,
 };
 use sqlx::{
-    Error, QueryBuilder, Sqlite, SqliteConnection, SqlitePool, query, query_as,
+    Error, QueryBuilder, Sqlite, SqliteConnection, SqlitePool, Transaction, query, query_as,
     sqlite::SqliteQueryResult,
 };
 use std::time::{SystemTime, UNIX_EPOCH};
 
-pub struct MessageReceipt {}
+pub struct MessageReceipt {
+    pub(crate) user_id: (),
+}
 pub struct Message {}
 pub struct Conversation {}
 pub struct Participant {}
 
-fn time_now() -> i64 {
+pub fn time_now() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
@@ -34,10 +36,24 @@ pub async fn is_participant(db: &SqlitePool, conversation: &String, user: &Strin
     .unwrap_or(false)
 }
 
+pub async fn is_sender(db: &SqlitePool, id: &String, user: &String) -> bool {
+    sqlx::query_scalar(
+        r#"SELECT EXISTS(
+            SELECT 1 FROM messages
+            WHERE id = ? AND source = ?
+        )"#,
+    )
+    .bind(id)
+    .bind(user)
+    .fetch_one(db)
+    .await
+    .unwrap_or(false)
+}
+
 impl MessageReceipt {
-    pub async fn create(
-        db: &SqlitePool,
-        msg: i64,
+    pub async fn upsert(
+        db: &mut SqliteConnection,
+        msg: String,
         user: &String,
         delivered: bool,
         read: bool,
@@ -52,8 +68,8 @@ impl MessageReceipt {
         VALUES (?, ?, ?, ?, ?)
         ON CONFLICT(message, user)
         DO UPDATE SET
-            delivered_at = COALESCE(delivered_at, excluded.delivered_at)
-        read_at = COALESCE(read_at, excluded.read_at)
+            delivered_at = COALESCE(delivered_at, excluded.delivered_at),
+        read_at = COALESCE(read_at, excluded.read_at),
         reaction = excluded.reaction
         "#,
         )
@@ -64,10 +80,10 @@ impl MessageReceipt {
         .bind(reaction)
         .execute(db)
         .await
-        .ok();
+        .unwrap();
     }
 
-    pub async fn retrieve(db: &SqlitePool, msg: i64) -> Result<Vec<Receipt>, Error> {
+    pub async fn retrieve(db: &SqlitePool, msg: String) -> Result<Vec<Receipt>, Error> {
         query_as::<_, Receipt>(
             r#"
         SELECT user, delivered_at, read_at, reaction FROM message_receipts WHERE message = ?
@@ -119,12 +135,13 @@ impl Message {
         let _ = query(
             r#"
         CREATE TABLE IF NOT EXISTS messages (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id TEXT NOT NULL,
             source TEXT NOT NULL,
             conversation TEXT NOT NULL,
             text TEXT NOT NULL,
             reply_to INTEGER,
-            created INTEGER NOT NULL
+            created INTEGER NOT NULL,
+            UNIQUE(id)
         )
         "#,
         )
@@ -136,7 +153,7 @@ impl Message {
         db: &SqlitePool,
         conversation: &String,
         query: MessageFilters,
-    ) -> Result<Vec<MessageResponse>, Error> {
+    ) -> Result<Vec<InsertMessage>, Error> {
         let mut qb = QueryBuilder::new(
             "SELECT id, conversation, source, text, created, reply_to
                 FROM messages WHERE 1=1",
@@ -148,30 +165,25 @@ impl Message {
         qb.push_bind(query.clone().limit());
         qb.push(" OFFSET ");
         qb.push_bind(query.offset());
-        qb.build_query_as::<MessageResponse>().fetch_all(db).await
+        qb.build_query_as::<InsertMessage>().fetch_all(db).await
     }
 
-    pub async fn insert(
-        db: &SqlitePool,
-        conversation: &String,
-        source: &String,
-        text: &String,
-        reply_to: &Option<i64>,
-    ) -> Result<MessageResponse, Error> {
+    pub async fn insert(db: &SqlitePool, msg: InsertMessage) -> Result<InsertMessage, Error> {
         let created = time_now();
 
-        sqlx::query_as::<_, MessageResponse>(
+        sqlx::query_as::<_, InsertMessage>(
             r#"
-        INSERT INTO messages ( conversation, source, text, created, reply_to)
+        INSERT INTO messages ( id, conversation, source, text, created, reply_to)
         VALUES ( ?, ?, ?, ?, ?)
         RETURNING id, conversation, source, text, created, reply_to
         "#,
         )
-        .bind(conversation)
-        .bind(source)
-        .bind(text)
-        .bind(created)
-        .bind(reply_to)
+        .bind(msg.id)
+        .bind(msg.conversation)
+        .bind(msg.source)
+        .bind(msg.text)
+        .bind(msg.created)
+        .bind(msg.reply_to)
         .fetch_one(db)
         .await
     }
@@ -180,13 +192,14 @@ impl Message {
         msgs: Vec<InsertMessage>,
     ) -> Result<SqliteQueryResult, Error> {
         let mut qb = QueryBuilder::<Sqlite>::new(
-            "INSERT INTO messages ( conversation, source, text, created, reply_to)",
+            "INSERT INTO messages ( id, conversation, source, text, created, reply_to)",
         );
         qb.push_values(msgs, |mut b, user| {
-            b.push_bind(user.conversation)
+            b.push_bind(user.id)
+                .push_bind(user.conversation)
                 .push_bind(user.source)
                 .push_bind(user.text)
-                .push_bind(time_now())
+                .push_bind(user.created)
                 .push_bind(user.reply_to);
         });
         qb.build().execute(db).await

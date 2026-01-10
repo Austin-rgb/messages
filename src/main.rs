@@ -1,3 +1,4 @@
+use ::redis::AsyncCommands;
 use actix::{Actor, Addr};
 use actix_web::{
     App, HttpResponse, HttpServer, Responder, get, post, rt, web,
@@ -6,117 +7,42 @@ use actix_web::{
 use auth_middleware::{Auth, Claims};
 use dotenvy::dotenv;
 use once_cell::sync::Lazy;
-use redis::{AsyncCommands, Client, RedisResult, Value, aio::Connection, cmd, from_redis_value};
+use redis::{Client, RedisResult, Value, aio::Connection, cmd, from_redis_value};
 use serde_json::{from_str, to_string};
 use sqlx::{SqlitePool, query, query_as};
-use std::{collections::HashMap, env, vec::Vec};
-use tokio::sync::{RwLock, mpsc};
+use std::{collections::HashMap, vec::Vec};
+use tokio::sync::RwLock;
 use uuid::Uuid;
 mod logging;
 mod models;
+mod redis_cfg;
 mod repositories;
+mod workers;
 mod ws;
-use crate::logging::LoggingMiddleware;
-use crate::models::{
-    AppState, ConversationListItem, ConversationResponse, CreateConversation, CreateMessage,
-    InsertMessage, MessageFilters, MessageResponse, Participant,
-};
+use crate::redis_cfg::{create_redis, ensure_group};
 use crate::repositories::{
-    Conversation, Message, MessageReceipt, Participant as PRepo, is_participant,
+    Conversation, Message, MessageReceipt, Participant as PRepo, is_participant, time_now,
 };
+use crate::workers::db_worker;
 use crate::ws::{ChatServer, DeliverMessage, ws_route};
-
-fn create_redis() -> Client {
-    let redis_url = env::var("REDIS").unwrap();
-    Client::open(redis_url).unwrap()
-}
+use crate::{logging::LoggingMiddleware, repositories::is_sender};
+use crate::{
+    models::{
+        AppState, ConversationListItem, ConversationResponse, CreateConversation, CreateMessage,
+        InsertMessage, MessageFilters, Participant, Receipt,
+    },
+    workers::receipt_worker,
+};
 
 fn deliver_message(msg: &InsertMessage, targets: Vec<String>, bus: Addr<ChatServer>) {
     let payload = serde_json::to_string(msg).expect("serialization failed");
     for participant in targets {
         bus.do_send(DeliverMessage {
+            id: msg.id.clone(),
             to: participant.clone(),
             payload: payload.clone(),
         });
     }
-}
-
-async fn ensure_group(conn: &mut Connection) {
-    let res: RedisResult<()> = cmd("XGROUP")
-        .arg("CREATE")
-        .arg("messages_stream")
-        .arg("db_group")
-        .arg("0")
-        .arg("MKSTREAM")
-        .query_async(conn)
-        .await;
-
-    if let Err(err) = res {
-        // BUSYGROUP means the group already exists — safe to ignore
-        if !err.to_string().contains("BUSYGROUP") {
-            panic!("Failed to create group: {err}");
-        }
-    }
-}
-
-async fn db_worker(redis: Client, db: &SqlitePool) {
-    let mut con = redis.get_async_connection().await.unwrap();
-    ensure_group(&mut con).await;
-
-    loop {
-        let streams: Value = cmd("XREADGROUP")
-            .arg("GROUP")
-            .arg("db_group")
-            .arg("worker-1")
-            .arg("COUNT")
-            .arg(50)
-            .arg("BLOCK")
-            .arg(5000)
-            .arg("STREAMS")
-            .arg("messages_stream")
-            .arg(">")
-            .query_async(&mut con)
-            .await
-            .unwrap();
-        let entries = parse_stream(streams);
-        let len = entries.len();
-        if len == 0 {
-            continue;
-        }
-        let msgs: Vec<InsertMessage> = entries
-            .iter()
-            .map(|(a, x)| from_str::<InsertMessage>(x).unwrap())
-            .collect();
-        match Message::insert_many(db, msgs).await {
-            Ok(_) => println!("inserted {} messages", len),
-            Err(e) => println!("insertion failed: {} \n entries: {:?}", e, entries),
-        };
-    }
-}
-
-fn parse_stream(v: Value) -> Vec<(String, String)> {
-    let mut out = Vec::new();
-
-    if let Value::Bulk(streams) = v {
-        for stream in streams {
-            if let Value::Bulk(items) = stream {
-                let entries = &items[1];
-                if let Value::Bulk(entries) = entries {
-                    for entry in entries {
-                        if let Value::Bulk(e) = entry {
-                            let id: String = from_redis_value(&e[0]).unwrap();
-                            let data = &e[1];
-                            if let Value::Bulk(kv) = data {
-                                let payload: String = from_redis_value(&kv[1]).unwrap();
-                                out.push((id, payload));
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-    out
 }
 
 static PARTICIPANTS_CACHE: Lazy<RwLock<HashMap<String, Vec<Participant>>>> =
@@ -354,6 +280,8 @@ async fn post_message(
         conversation: conversation_name,
         text: payload.text.clone(),
         reply_to: payload.reply_to,
+        created: time_now(),
+        id: Uuid::new_v4().to_string(),
     };
     //let _ = state.writer.send(msg.clone()).await;
     let mut conn = state.redis.get_async_connection().await.unwrap();
@@ -390,7 +318,7 @@ async fn get_messages(
         return HttpResponse::Forbidden().body("Not a participant in this conversation");
     }
 
-    let messages: Vec<MessageResponse> =
+    let messages: Vec<InsertMessage> =
         match repositories::Message::retrieve(&state.db, &conversation_name, query).await {
             Ok(msgs) => msgs,
             Err(e) => {
@@ -400,9 +328,28 @@ async fn get_messages(
         };
 
     let _messages = messages.clone();
+    let events: Vec<Receipt> = messages
+        .iter()
+        .map(|msg| Receipt {
+            message_id: msg.id.clone(),
+            user_id: claims.sub.clone(),
+            delivered: true,
+            read: false,
+            reaction: None,
+            ts: chrono::Utc::now().timestamp(),
+        })
+        .collect();
+    let redis = state.redis.clone();
     rt::spawn(async move {
-        for msg in _messages.iter() {
-            repositories::MessageReceipt::create(&state.db, msg.id, &claims.sub, true, false, None)
+        let mut conn = match redis.get_async_connection().await {
+            Ok(c) => c,
+            Err(_) => return,
+        };
+        for event in &events {
+            let payload = serde_json::to_string(&event).unwrap();
+
+            let _: redis::RedisResult<String> = conn
+                .xadd("receipts_stream", "*", &[("payload", payload)])
                 .await;
         }
     });
@@ -413,10 +360,14 @@ async fn get_messages(
 async fn get_receipts(
     state: web::Data<AppState>,
     claims: web::ReqData<Claims>,
-    path: Path<i64>,
+    path: Path<String>,
 ) -> impl Responder {
+    println!("fetching receipts");
     // confirm message ownership
     let msg = path.into_inner();
+    if !is_sender(&state.db, &msg, &claims.sub).await {
+        return HttpResponse::NotFound().finish();
+    }
     match MessageReceipt::retrieve(&state.db, msg).await {
         Ok(receipts) => HttpResponse::Ok().json(receipts),
         Err(e) => {
@@ -430,10 +381,30 @@ async fn get_receipts(
 async fn react(
     state: web::Data<AppState>,
     claims: web::ReqData<Claims>,
-    path: Path<(i64, i64)>,
+    path: Path<(String, i64)>,
 ) -> impl Responder {
     let (msg, reaction) = path.into_inner();
-    MessageReceipt::create(&state.db, msg, &claims.sub, false, false, Some(reaction)).await;
+    let event = Receipt {
+        message_id: msg,
+        user_id: claims.sub.clone(),
+        delivered: false,
+        read: false,
+        reaction: Some(reaction),
+        ts: chrono::Utc::now().timestamp(),
+    };
+    let redis = state.redis.clone();
+    rt::spawn(async move {
+        let mut conn = match redis.get_async_connection().await {
+            Ok(c) => c,
+            Err(_) => return,
+        };
+
+        let payload = serde_json::to_string(&event).unwrap();
+
+        let _: redis::RedisResult<String> = conn
+            .xadd("receipts_stream", "*", &[("payload", payload)])
+            .await;
+    });
     HttpResponse::Ok()
 }
 
@@ -441,10 +412,30 @@ async fn react(
 async fn mark_as_read(
     state: web::Data<AppState>,
     claims: web::ReqData<Claims>,
-    path: Path<i64>,
+    path: Path<String>,
 ) -> impl Responder {
     let msg = path.into_inner();
-    MessageReceipt::create(&state.db, msg, &claims.sub, false, true, None).await;
+    let event = Receipt {
+        message_id: msg,
+        user_id: claims.sub.clone(),
+        delivered: false,
+        read: false,
+        reaction: None,
+        ts: chrono::Utc::now().timestamp(),
+    };
+    let redis = state.redis.clone();
+    rt::spawn(async move {
+        let mut conn = match redis.get_async_connection().await {
+            Ok(c) => c,
+            Err(_) => return,
+        };
+
+        let payload = serde_json::to_string(&event).unwrap();
+
+        let _: redis::RedisResult<String> = conn
+            .xadd("receipts_stream", "*", &[("payload", payload)])
+            .await;
+    });
     HttpResponse::Ok()
 }
 
@@ -458,9 +449,12 @@ async fn main() -> std::io::Result<()> {
     init_db(&db).await.expect("DB init failed");
     let chat_server = ChatServer::new().start();
     let redis = create_redis();
-    let worker_c = redis.clone();
+    let redis_w1 = redis.clone();
+    let redis_w2 = redis.clone();
     let worker_d = db.clone();
-    tokio::spawn(async move { db_worker(worker_c, &worker_d).await });
+    let db_w2 = db.clone();
+    tokio::spawn(async move { db_worker(&redis_w1, &worker_d).await });
+    tokio::spawn(async move { receipt_worker(&redis_w2, &db_w2).await });
     let state = web::Data::new(AppState {
         db,
         chat_server,
@@ -477,6 +471,7 @@ async fn main() -> std::io::Result<()> {
                 .service(post_message)
                 .service(get_messages)
                 .service(react)
+                .service(get_receipts)
                 .service(mark_as_read)
                 .service(list_conversations)
                 .service(ws_route),
