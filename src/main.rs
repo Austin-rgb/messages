@@ -7,7 +7,7 @@ use actix_web::{
 use auth_middleware::{Auth, Claims};
 use dotenvy::dotenv;
 use once_cell::sync::Lazy;
-use redis::{Client, RedisResult, Value, aio::Connection, cmd, from_redis_value};
+use redis::RedisResult;
 use serde_json::{from_str, to_string};
 use sqlx::{SqlitePool, query, query_as};
 use std::{collections::HashMap, vec::Vec};
@@ -478,7 +478,7 @@ async fn main() -> std::io::Result<()> {
         )
     })
     .workers(12)
-    .bind(("127.0.0.1", 8080))?
+    .bind(("127.0.0.1", 8082))?
     .run()
     .await
 }

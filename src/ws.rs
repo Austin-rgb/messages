@@ -1,5 +1,4 @@
 use crate::models::{AppState, Receipt};
-use crate::repositories::MessageReceipt;
 use actix::{
     Actor, ActorContext, AsyncContext, Context, Handler, Message, Recipient, StreamHandler,
     WrapFuture,
@@ -10,7 +9,6 @@ use auth_middleware::Claims;
 use futures::executor::block_on;
 use redis::{AsyncCommands, Client};
 use serde::Deserialize;
-use sqlx::SqlitePool;
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 use uuid::Uuid;

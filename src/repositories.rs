@@ -3,7 +3,7 @@ use crate::models::{
     Participant as PModel,
 };
 use sqlx::{
-    Error, QueryBuilder, Sqlite, SqliteConnection, SqlitePool, Transaction, query, query_as,
+    Error, QueryBuilder, Sqlite, SqliteConnection, SqlitePool, query, query_as,
     sqlite::SqliteQueryResult,
 };
 use std::time::{SystemTime, UNIX_EPOCH};
