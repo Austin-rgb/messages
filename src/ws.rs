@@ -5,8 +5,8 @@ use actix::{
 };
 use actix_web::{Error, HttpRequest, HttpResponse, get, web};
 use actix_web_actors::ws;
-use auth_middleware::Claims;
-use futures::executor::block_on;
+use auth_middleware::UserContext;
+
 use redis::{AsyncCommands, Client};
 use serde::Deserialize;
 use std::collections::HashMap;
@@ -228,10 +228,10 @@ pub async fn ws_route(
     req: HttpRequest,
     stream: web::Payload,
     state: web::Data<AppState>,
-    claims: web::ReqData<Claims>,
+    claims: web::ReqData<UserContext>,
 ) -> Result<HttpResponse, Error> {
     let session = WsSession {
-        user_id: claims.sub.clone(),
+        user_id: claims.username.clone(),
         server: state.get_ref().chat_server.clone(),
         last_heartbeat: Instant::now(),
         redis: state.redis.clone(),

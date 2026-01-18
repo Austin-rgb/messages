@@ -4,7 +4,7 @@ use actix_web::{
     App, HttpResponse, HttpServer, Responder, get, post, rt, web,
     web::{Path, scope},
 };
-use auth_middleware::{Auth, Claims};
+use auth_middleware::{Auth, UserContext};
 use dotenvy::dotenv;
 use once_cell::sync::Lazy;
 use redis::RedisResult;
@@ -88,7 +88,7 @@ async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
 #[post("/conversations")]
 async fn create_conversation(
     state: web::Data<AppState>,
-    claims: web::ReqData<Claims>,
+    claims: web::ReqData<UserContext>,
     payload: web::Json<CreateConversation>,
 ) -> impl Responder {
     // Validation
@@ -123,7 +123,7 @@ async fn create_conversation(
     // 1️⃣ Create conversation (admin = creator)
 
     let conversation =
-        match Conversation::insert(&mut *tx, &name, &payload.title, &claims.sub).await {
+        match Conversation::insert(&mut *tx, &name, &payload.title, &claims.username).await {
             Ok(c) => c,
             Err(e) => {
                 eprintln!("Conversation insert error: {:?}", e);
@@ -132,7 +132,7 @@ async fn create_conversation(
         };
 
     // 2️⃣ Insert creator as participant
-    if let Err(e) = PRepo::insert(&mut *tx, &conversation.name, &claims.sub).await {
+    if let Err(e) = PRepo::insert(&mut *tx, &conversation.name, &claims.username).await {
         eprintln!("Participant insert error: {:?}", e);
         return HttpResponse::InternalServerError().finish();
     }
@@ -141,14 +141,10 @@ async fn create_conversation(
     let participants: Vec<String> = payload
         .participants
         .iter()
-        .filter(|u| *u != &claims.sub)
+        .filter(|u| *u != &claims.username)
         .cloned()
         .collect();
 
-    // if let Err(e) = PRepo::insert_many(&mut *tx, &conversation.name, participants).await {
-    //     eprintln!("Participant insert error: {:?}", e);
-    //     return HttpResponse::InternalServerError().finish();
-    // }
     for participant in participants {
         match PRepo::insert(&mut tx, &conversation.name, &participant).await {
             Ok(_) => (),
@@ -170,7 +166,7 @@ async fn create_conversation(
 #[get("/conversations")]
 async fn list_conversations(
     state: web::Data<AppState>,
-    claims: web::ReqData<Claims>,
+    claims: web::ReqData<UserContext>,
 ) -> impl Responder {
     let result = query_as::<_, ConversationListItem>(
         r#"
@@ -186,7 +182,7 @@ async fn list_conversations(
         ORDER BY c.created DESC
         "#,
     )
-    .bind(&claims.sub)
+    .bind(&claims.username)
     .fetch_all(&state.db)
     .await;
 
@@ -202,14 +198,14 @@ async fn list_conversations(
 #[get("/conversations/{name}")]
 async fn get_conversation(
     state: web::Data<AppState>,
-    claims: web::ReqData<Claims>,
+    claims: web::ReqData<UserContext>,
     path: Path<String>,
 ) -> impl Responder {
     let conversation_name = path.into_inner();
 
     // Check if user is a participant
 
-    if !is_participant(&state.db, &conversation_name, &claims.sub).await {
+    if !is_participant(&state.db, &conversation_name, &claims.username).await {
         return HttpResponse::Forbidden().body("Not a participant in this conversation");
     }
 
@@ -237,7 +233,7 @@ async fn get_conversation(
 #[post("/conversations/{name}/messages")]
 async fn post_message(
     state: web::Data<AppState>,
-    claims: web::ReqData<Claims>,
+    claims: web::ReqData<UserContext>,
     path: Path<String>,
     payload: web::Json<CreateMessage>,
 ) -> impl Responder {
@@ -268,7 +264,10 @@ async fn post_message(
         Some(p) => p,
     };
 
-    if !participants.iter().any(|p| p.participant == claims.sub) {
+    if !participants
+        .iter()
+        .any(|p| p.participant == claims.username)
+    {
         return HttpResponse::Forbidden().body("Not a participant in this conversation");
     }
 
@@ -276,7 +275,7 @@ async fn post_message(
     let bus = state.chat_server.clone();
 
     let msg = InsertMessage {
-        source: claims.sub.clone(),
+        source: claims.username.clone(),
         conversation: conversation_name,
         text: payload.text.clone(),
         reply_to: payload.reply_to,
@@ -306,7 +305,7 @@ async fn post_message(
 #[get("/conversations/{name}/messages")]
 async fn get_messages(
     state: web::Data<AppState>,
-    claims: web::ReqData<Claims>,
+    claims: web::ReqData<UserContext>,
     path: Path<String>,
     query: web::Query<MessageFilters>,
 ) -> impl Responder {
@@ -314,7 +313,7 @@ async fn get_messages(
     let query = query.into_inner();
     // Check if user is a participant
 
-    if !is_participant(&state.db, &conversation_name, &claims.sub).await {
+    if !is_participant(&state.db, &conversation_name, &claims.username).await {
         return HttpResponse::Forbidden().body("Not a participant in this conversation");
     }
 
@@ -332,7 +331,7 @@ async fn get_messages(
         .iter()
         .map(|msg| Receipt {
             message_id: msg.id.clone(),
-            user_id: claims.sub.clone(),
+            user_id: claims.username.clone(),
             delivered: true,
             read: false,
             reaction: None,
@@ -359,13 +358,13 @@ async fn get_messages(
 #[get("/messages/{msg}/receipts")]
 async fn get_receipts(
     state: web::Data<AppState>,
-    claims: web::ReqData<Claims>,
+    claims: web::ReqData<UserContext>,
     path: Path<String>,
 ) -> impl Responder {
     println!("fetching receipts");
     // confirm message ownership
     let msg = path.into_inner();
-    if !is_sender(&state.db, &msg, &claims.sub).await {
+    if !is_sender(&state.db, &msg, &claims.username).await {
         return HttpResponse::NotFound().finish();
     }
     match MessageReceipt::retrieve(&state.db, msg).await {
@@ -380,13 +379,13 @@ async fn get_receipts(
 #[get("/messages/{msg}/react/{reaction}")]
 async fn react(
     state: web::Data<AppState>,
-    claims: web::ReqData<Claims>,
+    claims: web::ReqData<UserContext>,
     path: Path<(String, i64)>,
 ) -> impl Responder {
     let (msg, reaction) = path.into_inner();
     let event = Receipt {
         message_id: msg,
-        user_id: claims.sub.clone(),
+        user_id: claims.username.clone(),
         delivered: false,
         read: false,
         reaction: Some(reaction),
@@ -411,13 +410,13 @@ async fn react(
 #[get("/messages/{msg}/mark_as_read")]
 async fn mark_as_read(
     state: web::Data<AppState>,
-    claims: web::ReqData<Claims>,
+    claims: web::ReqData<UserContext>,
     path: Path<String>,
 ) -> impl Responder {
     let msg = path.into_inner();
     let event = Receipt {
         message_id: msg,
-        user_id: claims.sub.clone(),
+        user_id: claims.username.clone(),
         delivered: false,
         read: false,
         reaction: None,
