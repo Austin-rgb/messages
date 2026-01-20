@@ -8,7 +8,7 @@ from auth import User
 
 AUTH_BASE = "http://localhost/auth/auth"
 MSG_BASE = "http://127.0.0.1/messages"
-WS_URL = "ws://127.0.0.1:/messages/ws/"
+WS_URL = "ws://127.0.0.1:8082/ws/"
 CONCURRENT_CONNECTIONS = 12
 # -----------------------------
 # Helpers
@@ -120,6 +120,7 @@ def ws_client(user: User, handler):
         on_message=on_message,
         on_open=on_connect,
     )
+
     ws.run_forever()
 
 

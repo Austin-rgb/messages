@@ -1,7 +1,6 @@
 use crate::models::{AppState, Receipt};
 use actix::{
     Actor, ActorContext, AsyncContext, Context, Handler, Message, Recipient, StreamHandler,
-    WrapFuture,
 };
 use actix_web::{Error, HttpRequest, HttpResponse, get, web};
 use actix_web_actors::ws;
@@ -237,5 +236,10 @@ pub async fn ws_route(
         redis: state.redis.clone(),
     };
 
-    ws::start(session, &req, stream)
+    let res = ws::start(session, &req, stream);
+    match &res {
+        Ok(r) => println!("ws response: {}", r.status()),
+        Err(e) => println!("ws error: {}", e),
+    }
+    res
 }
