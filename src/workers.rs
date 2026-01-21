@@ -1,141 +1,64 @@
 use crate::{
+    libworkers::stream_worker,
     models::{InsertMessage, Receipt},
-    redis_cfg::{ensure_group, ensure_receipts_group},
     repositories::{Message, MessageReceipt},
 };
-use redis::{Client, Value, cmd, from_redis_value};
-use serde_json::from_str;
+use redis::Client;
 use sqlx::SqlitePool;
 
-pub async fn receipt_worker(redis: &Client, db: &SqlitePool) {
-    let mut conn = redis.get_async_connection().await.unwrap();
-    ensure_receipts_group(&mut conn).await;
-
-    loop {
-        let res: Value = cmd("XREADGROUP")
-            .arg("GROUP")
-            .arg("receipts_group")
-            .arg("worker-1")
-            .arg("COUNT")
-            .arg(200)
-            .arg("BLOCK")
-            .arg(5000)
-            .arg("STREAMS")
-            .arg("receipts_stream")
-            .arg(">")
-            .query_async(&mut conn)
-            .await
-            .unwrap();
-
-        let entries = parse_receipt_stream(res);
-        if entries.is_empty() {
-            continue;
-        }
-
-        let mut tx = match db.begin().await {
-            Ok(tx) => tx,
-            Err(_) => continue,
-        };
-
-        for (_, payload) in &entries {
-            let evt: Receipt = serde_json::from_str(payload).unwrap();
-
-            // IMPORTANT: idempotent write
-            let _ = MessageReceipt::upsert(
-                &mut tx,
-                evt.message_id.clone(),
-                &evt.user_id,
-                evt.delivered,
-                evt.read,
-                evt.reaction,
-            )
-            .await;
-        }
-
-        let _ = tx.commit().await;
-    }
-}
-
+/// DB worker: insert messages from Redis stream safely
 pub async fn db_worker(redis: &Client, db: &SqlitePool) {
-    let mut con = redis.get_async_connection().await.unwrap();
-    ensure_group(&mut con).await;
+    // clone the pool so async block owns it
+    let db = db.clone();
 
-    loop {
-        let streams: Value = cmd("XREADGROUP")
-            .arg("GROUP")
-            .arg("db_group")
-            .arg("worker-1")
-            .arg("COUNT")
-            .arg(100)
-            .arg("BLOCK")
-            .arg(5000)
-            .arg("STREAMS")
-            .arg("messages_stream")
-            .arg(">")
-            .query_async(&mut con)
-            .await
-            .unwrap();
-        let entries = parse_stream(streams);
-        let len = entries.len();
-        if len == 0 {
-            continue;
-        }
-        let msgs: Vec<InsertMessage> = entries
-            .iter()
-            .map(|(a, x)| from_str::<InsertMessage>(x).unwrap())
-            .collect();
-        match Message::insert_many(db, msgs).await {
-            Ok(_) => println!("inserted {} messages", len),
-            Err(e) => println!("insertion failed: {} \n entries: {:?}", e, entries),
-        };
-    }
-}
-
-fn parse_receipt_stream(v: Value) -> Vec<(String, String)> {
-    let mut out = Vec::new();
-
-    if let Value::Bulk(streams) = v {
-        for stream in streams {
-            if let Value::Bulk(items) = stream {
-                if let Value::Bulk(entries) = &items[1] {
-                    for entry in entries {
-                        if let Value::Bulk(e) = entry {
-                            let id: String = redis::from_redis_value(&e[0]).unwrap();
-                            if let Value::Bulk(kv) = &e[1] {
-                                let payload: String = redis::from_redis_value(&kv[1]).unwrap();
-                                out.push((id, payload));
-                            }
-                        }
-                    }
+    stream_worker::<InsertMessage, _, _>(
+        redis,
+        db,
+        "messages_stream",
+        "db_group",
+        async move |msgs: Vec<(String, InsertMessage)>, db: SqlitePool| {
+            // compute IDs before async move
+            let (ack_ids, msgs): (Vec<String>, Vec<InsertMessage>) = msgs.into_iter().unzip();
+            //async move {
+            // insert messages (msgs is moved here)
+            match Message::insert_many(&db, msgs).await {
+                Ok(_) => {
+                    println!("inserted {} msgs", ack_ids.len());
+                    ack_ids
+                }
+                Err(e) => {
+                    eprintln!("DB insert failed: {}", e);
+                    Vec::new()
                 }
             }
-        }
-    }
-
-    out
+            //}
+        },
+    )
+    .await;
 }
 
-fn parse_stream(v: Value) -> Vec<(String, String)> {
-    let mut out = Vec::new();
-
-    if let Value::Bulk(streams) = v {
-        for stream in streams {
-            if let Value::Bulk(items) = stream {
-                let entries = &items[1];
-                if let Value::Bulk(entries) = entries {
-                    for entry in entries {
-                        if let Value::Bulk(e) = entry {
-                            let id: String = from_redis_value(&e[0]).unwrap();
-                            let data = &e[1];
-                            if let Value::Bulk(kv) = data {
-                                let payload: String = from_redis_value(&kv[1]).unwrap();
-                                out.push((id, payload));
-                            }
-                        }
-                    }
+/// Receipt worker: insert message receipts safely
+pub async fn receipt_worker(redis: &Client, db: &SqlitePool) {
+    stream_worker::<Receipt, _, _>(
+        redis,
+        db.clone(),
+        "receipts_stream",
+        "receipts_group",
+        async move |receipts, db| {
+            let (ids, receipts): (Vec<String>, Vec<Receipt>) = receipts.into_iter().unzip();
+            //async move {
+            let mut tx = match db.begin().await {
+                Ok(tx) => tx,
+                Err(e) => {
+                    eprintln!("DB transaction start failed: {}", e);
+                    return Vec::new(); // return empty vec
                 }
-            }
-        }
-    }
-    out
+            };
+
+            let _ = MessageReceipt::batch_upsert(&mut tx, &receipts).await;
+            let _ = tx.commit().await;
+            ids
+        }, //},
+    )
+    .await;
 }

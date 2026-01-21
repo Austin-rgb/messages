@@ -1,6 +1,6 @@
 use crate::models::{
-    ConversationResponse, InsertMessage, MessageFilters, MessageReceipt as Receipt,
-    Participant as PModel,
+    ConversationResponse, InsertMessage, MessageFilters, Participant as PModel, Receipt,
+    RetrieveReceipt,
 };
 use sqlx::{
     Error, QueryBuilder, Sqlite, SqliteConnection, SqlitePool, query, query_as,
@@ -9,8 +9,9 @@ use sqlx::{
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub struct MessageReceipt {
-    pub(crate) user_id: (),
+    pub user_id: (),
 }
+
 pub struct Message {}
 pub struct Conversation {}
 pub struct Participant {}
@@ -51,17 +52,10 @@ pub async fn is_sender(db: &SqlitePool, id: &String, user: &String) -> bool {
 }
 
 impl MessageReceipt {
-    pub async fn upsert(
-        db: &mut SqliteConnection,
-        msg: String,
-        user: &String,
-        delivered: bool,
-        read: bool,
-        reaction: Option<i64>,
-    ) {
+    pub async fn upsert(db: &mut SqliteConnection, receipt: &Receipt) {
         let now = time_now();
-        let delivered_at: Option<i64> = if delivered { Some(now) } else { None };
-        let read_at: Option<i64> = if read { Some(now) } else { None };
+        let delivered_at: Option<i64> = if receipt.delivered { Some(now) } else { None };
+        let read_at: Option<i64> = if receipt.read { Some(now) } else { None };
         let _ = query(
             r#"
         INSERT INTO message_receipts (message, user, delivered_at, read_at, reaction)
@@ -73,20 +67,20 @@ impl MessageReceipt {
         reaction = excluded.reaction
         "#,
         )
-        .bind(msg)
-        .bind(user)
+        .bind(receipt.message.clone())
+        .bind(receipt.user.clone())
         .bind(delivered_at)
         .bind(read_at)
-        .bind(reaction)
+        .bind(receipt.reaction)
         .execute(db)
         .await
         .unwrap();
     }
 
-    pub async fn retrieve(db: &SqlitePool, msg: String) -> Result<Vec<Receipt>, Error> {
-        query_as::<_, Receipt>(
+    pub async fn retrieve(db: &SqlitePool, msg: String) -> Result<Vec<RetrieveReceipt>, Error> {
+        query_as::<_, RetrieveReceipt>(
             r#"
-        SELECT user, delivered_at, read_at, reaction FROM message_receipts WHERE message = ?
+        SELECT  message, user, delivered_at, read_at, reaction FROM message_receipts WHERE message = ?
         "#,
         )
         .bind(msg)
@@ -110,6 +104,52 @@ impl MessageReceipt {
         )
         .execute(db)
         .await;
+    }
+
+    pub async fn batch_upsert(
+        db: &mut SqliteConnection,
+        receipts: &[Receipt],
+    ) -> Result<(), sqlx::Error> {
+        if receipts.is_empty() {
+            return Ok(());
+        }
+
+        let now = time_now();
+
+        // Start building the query
+        let mut qb = QueryBuilder::<Sqlite>::new(
+            r#"
+        INSERT INTO message_receipts (message, user, delivered_at, read_at, reaction)
+        "#,
+        );
+
+        // Add VALUES
+        qb.push_values(receipts, |mut b, r| {
+            let delivered_at: Option<i64> = if r.delivered { Some(now) } else { None };
+            let read_at: Option<i64> = if r.read { Some(now) } else { None };
+
+            b.push_bind(&r.message)
+                .push_bind(&r.user)
+                .push_bind(delivered_at)
+                .push_bind(read_at)
+                .push_bind(r.reaction);
+        });
+
+        // Add ON CONFLICT clause
+        qb.push(
+            r#"
+        ON CONFLICT(message, user)
+        DO UPDATE SET
+            delivered_at = COALESCE(message_receipts.delivered_at, excluded.delivered_at),
+            read_at = COALESCE(message_receipts.read_at, excluded.read_at),
+            reaction = excluded.reaction
+        "#,
+        );
+
+        // Execute
+        qb.build().execute(db).await?;
+
+        Ok(())
     }
 }
 

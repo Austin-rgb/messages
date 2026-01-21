@@ -205,12 +205,11 @@ impl Handler<ServerMessage> for WsSession {
             };
 
             let event = Receipt {
-                message_id: msg_id,
-                user_id,
+                message: msg_id,
+                user: user_id,
                 delivered: true,
                 read: false,
                 reaction: None,
-                ts: chrono::Utc::now().timestamp(),
             };
 
             let payload = serde_json::to_string(&event).unwrap();
@@ -236,10 +235,5 @@ pub async fn ws_route(
         redis: state.redis.clone(),
     };
 
-    let res = ws::start(session, &req, stream);
-    match &res {
-        Ok(r) => println!("ws response: {}", r.status()),
-        Err(e) => println!("ws error: {}", e),
-    }
-    res
+    ws::start(session, &req, stream)
 }

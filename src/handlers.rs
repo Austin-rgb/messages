@@ -5,11 +5,11 @@ use once_cell::sync::Lazy;
 use redis::RedisResult;
 use serde_json::to_string;
 use sqlx::query_as;
-use std::collections::HashMap;
 use std::vec::Vec;
-use tokio::sync::RwLock;
 use uuid::Uuid;
 
+use crate::libcache::{Cache, CacheError};
+use crate::redis_cfg::create_redis;
 use crate::repositories;
 use crate::repositories::is_sender;
 use crate::repositories::{
@@ -23,8 +23,9 @@ use crate::{
     },
 };
 
-static PARTICIPANTS_CACHE: Lazy<RwLock<HashMap<String, Vec<Participant>>>> =
-    Lazy::new(|| RwLock::new(HashMap::new()));
+pub static PARTICIPANTS_CACHE: Lazy<Cache<Vec<Participant>>> = Lazy::new(|| {
+    Cache::<Vec<Participant>>::new(create_redis(), 60) // TTL = 60s
+});
 
 #[post("/conversations")]
 async fn create_conversation(
@@ -179,31 +180,16 @@ async fn post_message(
     payload: web::Json<CreateMessage>,
 ) -> impl Responder {
     let conversation_name = path.into_inner();
-    // validate that participation and conversation exists
-    let p = PARTICIPANTS_CACHE
-        .read()
+    // 1️⃣ Get participants from cache or fallback to DB
+    let participants: Vec<Participant> = PARTICIPANTS_CACHE
+        .get(&conversation_name, || async {
+            // fallback closure if cache miss
+            repositories::Participant::retrieve(&state.db, &conversation_name, 1000, 0)
+                .await
+                .map_err(|e| CacheError::Fallback)
+        })
         .await
-        .get(&conversation_name)
-        .cloned();
-    let participants: Vec<Participant> = match p {
-        None => match repositories::Participant::retrieve(&state.db, &conversation_name, 1000, 0)
-            .await
-        {
-            Ok(p) => {
-                PARTICIPANTS_CACHE
-                    .write()
-                    .await
-                    .insert(conversation_name.clone(), p.clone());
-                p
-            }
-            Err(e) => {
-                eprintln!("Error getting participants: {:?}", e);
-                return HttpResponse::InternalServerError().finish();
-            }
-        },
-
-        Some(p) => p,
-    };
+        .unwrap();
 
     if !participants
         .iter()
@@ -271,12 +257,11 @@ async fn get_messages(
     let events: Vec<Receipt> = messages
         .iter()
         .map(|msg| Receipt {
-            message_id: msg.id.clone(),
-            user_id: claims.username.clone(),
+            message: msg.id.clone(),
+            user: claims.username.clone(),
             delivered: true,
             read: false,
             reaction: None,
-            ts: chrono::Utc::now().timestamp(),
         })
         .collect();
     let redis = state.redis.clone();
@@ -302,7 +287,6 @@ async fn get_receipts(
     claims: web::ReqData<UserContext>,
     path: Path<String>,
 ) -> impl Responder {
-    println!("fetching receipts");
     // confirm message ownership
     let msg = path.into_inner();
     if !is_sender(&state.db, &msg, &claims.username).await {
@@ -325,12 +309,11 @@ async fn react(
 ) -> impl Responder {
     let (msg, reaction) = path.into_inner();
     let event = Receipt {
-        message_id: msg,
-        user_id: claims.username.clone(),
+        message: msg,
+        user: claims.username.clone(),
         delivered: false,
         read: false,
         reaction: Some(reaction),
-        ts: chrono::Utc::now().timestamp(),
     };
     let redis = state.redis.clone();
     rt::spawn(async move {
@@ -356,12 +339,11 @@ async fn mark_as_read(
 ) -> impl Responder {
     let msg = path.into_inner();
     let event = Receipt {
-        message_id: msg,
-        user_id: claims.username.clone(),
+        message: msg,
+        user: claims.username.clone(),
         delivered: false,
         read: false,
         reaction: None,
-        ts: chrono::Utc::now().timestamp(),
     };
     let redis = state.redis.clone();
     rt::spawn(async move {

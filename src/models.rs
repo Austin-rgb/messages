@@ -67,7 +67,7 @@ pub struct ConversationResponse {
     pub created: i64,
 }
 
-#[derive(FromRow, Clone)]
+#[derive(FromRow, Clone, Serialize, Deserialize)]
 pub struct Participant {
     id: i64,
     conversation: String,
@@ -90,10 +90,18 @@ pub struct MessageReceipt {
 
 #[derive(Serialize, Deserialize)]
 pub struct Receipt {
-    pub message_id: String,
-    pub user_id: String,
+    pub message: String,
+    pub user: String,
     pub delivered: bool,
     pub read: bool,
     pub reaction: Option<i64>,
-    pub ts: i64,
+}
+
+#[derive(FromRow, Serialize)]
+pub struct RetrieveReceipt {
+    pub message: String,
+    pub user: String,
+    pub delivered_at: Option<i64>,
+    pub read_at: Option<i64>,
+    pub reaction: Option<i64>,
 }

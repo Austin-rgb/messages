@@ -6,9 +6,12 @@ use dotenvy::dotenv;
 use sqlx::{SqlitePool, query};
 use std::vec::Vec;
 
+mod libcache;
+mod libworkers;
 mod logging;
 mod models;
 mod redis_cfg;
+mod repo;
 mod repositories;
 mod workers;
 mod ws;
@@ -98,7 +101,7 @@ async fn main() -> std::io::Result<()> {
     HttpServer::new(move || {
         App::new().app_data(state.clone()).service(
             scope("")
-                .wrap(LoggingMiddleware)
+                //.wrap(LoggingMiddleware)
                 .wrap(Auth)
                 .service(ws_route)
                 .configure(config),
