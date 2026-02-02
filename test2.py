@@ -8,7 +8,7 @@ from auth import User
 
 AUTH_BASE = "http://localhost/auth/auth"
 MSG_BASE = "http://127.0.0.1/messages"
-WS_URL = "ws://127.0.0.1:8082/ws/"
+WS_URL = "ws://127.0.0.1/messages/ws/"
 CONCURRENT_CONNECTIONS = 12
 # -----------------------------
 # Helpers
@@ -91,15 +91,40 @@ def send_message(session, token, conv, text):
     )
 
 
-def fetch_messages(session, token, conv):
+def send_pmessage(session, token, peer, text):
+    session.post(
+        f"{MSG_BASE}/inbox/{peer}/messages",
+        json={"text": text},
+        headers={"Authorization": f"Bearer {token}"},
+    )
+
+
+def fetch_messages(session, token, conv=None, peer=None):
+    if conv:
+        with session.get(
+            f"{MSG_BASE}/conversations/{conv}/messages",
+            headers={"Authorization": f"Bearer {token}"},
+        ) as r:
+            return r.json()
+
+    if peer:
+        with session.get(
+            f"{MSG_BASE}/inbox/messages",
+            headers={"Authorization": f"Bearer {token}"},
+            params={"source": peer},
+        ) as r:
+            return r.json()
+
+
+def fetch_pmessages(session, token, conv):
     with session.get(
-        f"{MSG_BASE}/conversations/{conv}/messages",
+        f"{MSG_BASE}//{conv}/messages",
         headers={"Authorization": f"Bearer {token}"},
     ) as r:
         return r.json()
 
 
-def fetch_receipts(session, token, message):
+def fetch_receipts(session: requests.Session, token, message):
     with session.get(
         f"{MSG_BASE}/messages/{message}/receipts",
         headers={"Authorization": f"Bearer {token}"},
@@ -109,6 +134,7 @@ def fetch_receipts(session, token, message):
 
 def ws_client(user: User, handler):
     def on_message(ws, message):
+        print(message)
         handler(loads(message))
 
     def on_connect(ws):
@@ -161,11 +187,11 @@ if __name__ == "__main__":
     # Peer-to-peer
     # -----------------------------
     print("💬 Testing P2P conversation...")
-    conv_p2p = create_conversation(session, users[0].access, [users[1].username])
-    send_message(session, users[0].access, conv_p2p, "P2P hello")
+    # conv_p2p = create_conversation(session, users[0].access, [users[1].username])
+    send_pmessage(session, users[0].access, users[1].username, "P2P hello")
     sleep(2)
     print(inboxes)
-    history = fetch_messages(session, users[0].access, conv_p2p)
+    history = fetch_messages(session, users[0].access, peer=users[1].username)
     print(inboxes[1])
     assert any("P2P hello" in m["text"] for m in inboxes[1])
     print("✅ P2P OK")
@@ -188,7 +214,7 @@ if __name__ == "__main__":
         if inbox != inboxes[1]:
             assert any("Hello group" in m["text"] for m in inbox)
 
-    history = fetch_messages(session, users[-1].access, conv_group)
+    history = fetch_messages(session, users[-1].access, conv=conv_group)
     # assert any("Hello group" in m["text"] for m in history)
 
     print("✅ Group chat OK")

@@ -6,10 +6,10 @@ use actix_web::{Error, HttpRequest, HttpResponse, get, web};
 use actix_web_actors::ws;
 use auth_middleware::UserContext;
 
-use redis::{AsyncCommands, Client};
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
+use tokio::sync::mpsc::Sender;
 use uuid::Uuid;
 
 #[derive(Message)]
@@ -104,7 +104,7 @@ impl Handler<DeliverMessage> for ChatServer {
         if let Some(recipient) = self.users.get(&msg.to) {
             let _ = recipient.do_send(ServerMessage {
                 payload: msg.payload,
-                id: msg.id.to_string(),
+                id: msg.id,
             });
         }
     }
@@ -113,7 +113,7 @@ impl Handler<DeliverMessage> for ChatServer {
 pub struct WsSession {
     user_id: String,
     server: actix::Addr<ChatServer>,
-    redis: Client,
+    rt_worker: Sender<Receipt>,
     last_heartbeat: Instant,
 }
 
@@ -196,28 +196,16 @@ impl Handler<ServerMessage> for WsSession {
     fn handle(&mut self, msg: ServerMessage, ctx: &mut Self::Context) {
         ctx.text(msg.payload);
         let user_id = self.user_id.clone();
-        let redis = self.redis.clone();
         let msg_id = msg.id.clone();
-        actix::spawn(async move {
-            let mut conn = match redis.get_async_connection().await {
-                Ok(c) => c,
-                Err(_) => return,
-            };
+        let event = Receipt {
+            message: msg_id,
+            user: user_id,
+            delivered: true,
+            read: false,
+            reaction: None,
+        };
 
-            let event = Receipt {
-                message: msg_id,
-                user: user_id,
-                delivered: true,
-                read: false,
-                reaction: None,
-            };
-
-            let payload = serde_json::to_string(&event).unwrap();
-
-            let _: redis::RedisResult<String> = conn
-                .xadd("receipts_stream", "*", &[("payload", payload)])
-                .await;
-        });
+        self.rt_worker.send(event);
     }
 }
 
@@ -232,7 +220,7 @@ pub async fn ws_route(
         user_id: claims.username.clone(),
         server: state.get_ref().chat_server.clone(),
         last_heartbeat: Instant::now(),
-        redis: state.redis.clone(),
+        rt_worker: state.workers.receipt_worker.clone(),
     };
 
     ws::start(session, &req, stream)

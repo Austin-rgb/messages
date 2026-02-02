@@ -1,9 +1,9 @@
 use crate::models::{
-    ConversationResponse, InsertMessage, MessageFilters, Participant as PModel, Receipt,
-    RetrieveReceipt,
+    Box as BoxModel, ConversationResponse, InsertConversation, InsertMessage, MessageFilters,
+    Participant as PModel, Receipt, RetrieveReceipt,
 };
 use sqlx::{
-    Error, QueryBuilder, Sqlite, SqliteConnection, SqlitePool, query, query_as,
+    Error, Pool, QueryBuilder, Sqlite, SqliteConnection, SqlitePool, query, query_as,
     sqlite::SqliteQueryResult,
 };
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -17,10 +17,13 @@ pub struct Conversation {}
 pub struct Participant {}
 
 pub fn time_now() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_millis() as i64
+    match SystemTime::now().duration_since(UNIX_EPOCH) {
+        Ok(t) => t.as_millis() as i64,
+        Err(e) => {
+            eprintln!("{}", e);
+            panic!();
+        }
+    }
 }
 
 pub async fn is_participant(db: &SqlitePool, conversation: &String, user: &String) -> bool {
@@ -73,8 +76,7 @@ impl MessageReceipt {
         .bind(read_at)
         .bind(receipt.reaction)
         .execute(db)
-        .await
-        .unwrap();
+        .await;
     }
 
     pub async fn retrieve(db: &SqlitePool, msg: String) -> Result<Vec<RetrieveReceipt>, Error> {
@@ -177,7 +179,7 @@ impl Message {
         CREATE TABLE IF NOT EXISTS messages (
             id TEXT NOT NULL,
             source TEXT NOT NULL,
-            conversation TEXT NOT NULL,
+            mbox TEXT NOT NULL,
             text TEXT NOT NULL,
             reply_to INTEGER,
             created INTEGER NOT NULL,
@@ -195,11 +197,11 @@ impl Message {
         query: MessageFilters,
     ) -> Result<Vec<InsertMessage>, Error> {
         let mut qb = QueryBuilder::new(
-            "SELECT id, conversation, source, text, created, reply_to
+            "SELECT id,mbox, source, text, created, reply_to
                 FROM messages WHERE 1=1",
         );
         qb = Message::build_filters(qb, query.clone());
-        qb.push(" AND conversation = ");
+        qb.push(" AND mbox = ");
         qb.push_bind(conversation);
         qb.push(" LIMIT ");
         qb.push_bind(query.clone().limit());
@@ -209,17 +211,15 @@ impl Message {
     }
 
     pub async fn insert(db: &SqlitePool, msg: InsertMessage) -> Result<InsertMessage, Error> {
-        let created = time_now();
-
         sqlx::query_as::<_, InsertMessage>(
             r#"
-        INSERT INTO messages ( id, conversation, source, text, created, reply_to)
+        INSERT INTO messages ( id,mbox source, text, created, reply_to)
         VALUES ( ?, ?, ?, ?, ?)
-        RETURNING id, conversation, source, text, created, reply_to
+        RETURNING id,mbox source, text, created, reply_to
         "#,
         )
         .bind(msg.id)
-        .bind(msg.conversation)
+        .bind(msg.mbox)
         .bind(msg.source)
         .bind(msg.text)
         .bind(msg.created)
@@ -232,11 +232,11 @@ impl Message {
         msgs: Vec<InsertMessage>,
     ) -> Result<SqliteQueryResult, Error> {
         let mut qb = QueryBuilder::<Sqlite>::new(
-            "INSERT INTO messages ( id, conversation, source, text, created, reply_to)",
+            "INSERT INTO messages ( id, mbox, source, text, created, reply_to)",
         );
         qb.push_values(msgs, |mut b, user| {
             b.push_bind(user.id)
-                .push_bind(user.conversation)
+                .push_bind(user.mbox)
                 .push_bind(user.source)
                 .push_bind(user.text)
                 .push_bind(user.created)
@@ -254,7 +254,8 @@ impl Conversation {
             name TEXT PRIMARY KEY,
             admin TEXT NOT NULL,
     title TEXT,
-            created INTEGER NOT NULL
+            created INTEGER NOT NULL,
+            mbox TEXT NOT NULL
         )
         "#,
         )
@@ -263,9 +264,7 @@ impl Conversation {
     }
     pub async fn insert(
         tx: &mut SqliteConnection,
-        conversation_name: &str,
-        title: &Option<String>,
-        admin: &str,
+        conv: &InsertConversation,
     ) -> Result<ConversationResponse, Error> {
         let created = time_now();
         query_as::<_, ConversationResponse>(
@@ -275,10 +274,47 @@ impl Conversation {
         RETURNING title, name, admin, created
         "#,
         )
-        .bind(conversation_name)
-        .bind(title)
-        .bind(admin)
+        .bind(conv.name.clone())
+        .bind(conv.title.clone())
+        .bind(conv.admin.clone())
         .bind(created)
+        .fetch_one(tx)
+        .await
+    }
+}
+
+pub struct Box {}
+
+impl Box {
+    pub async fn create_table(db: &SqlitePool) {
+        let _ = query(
+            r#"
+        CREATE TABLE IF NOT EXISTS boxes (
+            id TEXT PRIMARY KEY,
+            owner TEXT NOT NULL,
+    title TEXT,
+            kind INTEGER NOT NULL
+        )
+        "#,
+        )
+        .execute(db)
+        .await;
+    }
+
+    pub async fn insert(
+        tx: &Pool<Sqlite>,
+        msgbox: BoxModel,
+    ) -> Result<ConversationResponse, Error> {
+        query_as::<_, ConversationResponse>(
+            r#"
+        INSERT INTO boxes (id, owner, kind)
+        VALUES (?, ?, ?)
+        RETURNING title, name, admin, created
+        "#,
+        )
+        .bind(msgbox.id)
+        .bind(msgbox.owner)
+        .bind(msgbox.kind as u32)
         .fetch_one(tx)
         .await
     }

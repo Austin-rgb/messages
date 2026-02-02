@@ -6,24 +6,18 @@ use dotenvy::dotenv;
 use sqlx::{SqlitePool, query};
 use std::vec::Vec;
 
-mod libcache;
-mod libworkers;
 mod logging;
 mod models;
-mod redis_cfg;
-mod repo;
 mod repositories;
 mod workers;
 mod ws;
-use crate::logging::LoggingMiddleware;
-use crate::repositories::{Conversation, Message, MessageReceipt, Participant as PRepo};
-use crate::workers::db_worker;
+use crate::config::config;
+use crate::models::{AppState, InsertMessage};
+use crate::models::{Receipt, Workers};
+use crate::repositories::{Box, Conversation, Message, MessageReceipt, Participant as PRepo};
+use crate::workers::{IMHandler, ReceiptHandler};
 use crate::ws::{ChatServer, DeliverMessage, ws_route};
-use crate::{config::config, redis_cfg::create_redis};
-use crate::{
-    models::{AppState, InsertMessage},
-    workers::receipt_worker,
-};
+use libworkers::{BatchWorker, MpscQueue};
 mod config;
 mod handlers;
 
@@ -43,16 +37,18 @@ async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
     Conversation::create_table(db).await;
     MessageReceipt::create_table(db).await;
     PRepo::create_table(db).await;
+    Box::create_table(db).await;
 
     // Add indexes
     query(
         r#"
-        CREATE INDEX IF NOT EXISTS idx_messages_conversation 
-        ON messages(conversation, created)
+        CREATE INDEX IF NOT EXISTS idx_messages_conversations 
+        ON messages(mbox, created)
         "#,
     )
     .execute(db)
-    .await?;
+    .await
+    .unwrap();
 
     query(
         r#"
@@ -61,7 +57,8 @@ async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
         "#,
     )
     .execute(db)
-    .await?;
+    .await
+    .unwrap();
 
     query(
         r#"
@@ -70,7 +67,8 @@ async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
         "#,
     )
     .execute(db)
-    .await?;
+    .await
+    .unwrap();
 
     Ok(())
 }
@@ -78,25 +76,33 @@ async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
     dotenv().ok();
+
     let db = SqlitePool::connect("sqlite://messages.db?mode=rwc")
         .await
         .expect("Failed to connect to DB");
 
     init_db(&db).await.expect("DB init failed");
     let chat_server = ChatServer::new().start();
-    let redis = create_redis();
-    let redis_w1 = redis.clone();
-    let redis_w2 = redis.clone();
     let worker_d = db.clone();
-    let db_w2 = db.clone();
-    tokio::spawn(async move { db_worker(&redis_w1, &worker_d).await });
-    tokio::spawn(async move { receipt_worker(&redis_w2, &db_w2).await });
+
+    let mut msg_writer: MpscQueue<InsertMessage> = MpscQueue::new();
+    let msg_worker = msg_writer.sender.clone();
+    let mut rt_writer: MpscQueue<Receipt> = MpscQueue::new();
+    tokio::spawn(async move { msg_writer.start_worker(worker_d, 100, IMHandler {}).await });
+
+    let value = db.clone();
+    let receipt_worker = rt_writer.sender.clone();
+    tokio::spawn(async move { rt_writer.start_worker(value, 100, ReceiptHandler {}).await });
     let state = web::Data::new(AppState {
         db,
         chat_server,
-        redis,
+        workers: Workers {
+            msg_worker,
+            receipt_worker,
+        },
     });
     //env_logger::init_from_env(env_logger::Env::new().default_filter_or("info"));
+    //
 
     HttpServer::new(move || {
         App::new().app_data(state.clone()).service(

@@ -1,20 +1,14 @@
-use ::redis::AsyncCommands;
 use actix_web::{HttpResponse, Responder, get, post, rt, web, web::Path};
 use auth_middleware::UserContext;
 use once_cell::sync::Lazy;
-use redis::RedisResult;
-use serde_json::to_string;
-use sqlx::query_as;
-use std::vec::Vec;
-use uuid::Uuid;
 
-use crate::libcache::{Cache, CacheError};
-use crate::redis_cfg::create_redis;
+use crate::models::{Box as BoxModel, InsertConversation};
 use crate::repositories;
 use crate::repositories::is_sender;
 use crate::repositories::{
     Conversation, MessageReceipt, Participant as PRepo, is_participant, time_now,
 };
+use crate::ws::DeliverMessage;
 use crate::{
     deliver_message,
     models::{
@@ -22,9 +16,47 @@ use crate::{
         InsertMessage, MessageFilters, Participant, Receipt,
     },
 };
+use libworkers::{Cache, CacheError, LocalCache};
+use repositories::Box;
+use serde_json::to_string;
+use sqlx::{SqlitePool, query_as};
+use std::vec::Vec;
+use uuid::Uuid;
 
-pub static PARTICIPANTS_CACHE: Lazy<Cache<Vec<Participant>>> = Lazy::new(|| {
-    Cache::<Vec<Participant>>::new(create_redis(), 60) // TTL = 60s
+async fn get_default_mbox(db: &SqlitePool, peer: String) -> Result<String, CacheError> {
+    MBOX_CACHE
+        .get(&peer, async || {
+            let mbox = query_as::<_, BoxModel>(r#"select * from boxes where owner=?"#)
+                .bind(peer.clone())
+                .fetch_one(db)
+                .await;
+            match mbox {
+                Ok(mb) => Ok(mb.id),
+                Err(e) => match e {
+                    sqlx::Error::RowNotFound => Ok(create_default_mbox(db, peer.clone()).await),
+                    _ => return Err(CacheError::Fallback),
+                },
+            }
+        })
+        .await
+}
+
+async fn create_default_mbox(db: &SqlitePool, owner: String) -> String {
+    let mbox = BoxModel {
+        id: Uuid::new_v4().to_string(),
+        owner,
+        kind: 0,
+    };
+    let _ = Box::insert(db, mbox.clone()).await;
+    mbox.id
+}
+
+pub static PARTICIPANTS_CACHE: Lazy<LocalCache<Vec<Participant>>> = Lazy::new(|| {
+    LocalCache::new(600) // TTL = 60s
+});
+
+pub static MBOX_CACHE: Lazy<LocalCache<String>> = Lazy::new(|| {
+    LocalCache::new(600) // TTL = 60s
 });
 
 #[post("/conversations")]
@@ -43,35 +75,23 @@ async fn create_conversation(
         Err(_) => return HttpResponse::InternalServerError().finish(),
     };
 
-    let name = payload
-        .name
-        .clone()
-        .unwrap_or_else(|| Uuid::new_v4().to_string());
+    let name = Uuid::new_v4().to_string();
 
-    // Check if the name already exists
-    let exists: Option<ConversationResponse> = query_as::<_, ConversationResponse>(
-        "SELECT name, admin, title, created FROM conversations WHERE name = ?",
-    )
-    .bind(&name)
-    .fetch_optional(&mut *tx)
-    .await
-    .unwrap(); // handle error properly in real code
-
-    let name = if exists.is_some() {
-        Uuid::new_v4().to_string()
-    } else {
-        name.clone()
-    };
     // 1️⃣ Create conversation (admin = creator)
 
-    let conversation =
-        match Conversation::insert(&mut *tx, &name, &payload.title, &claims.username).await {
-            Ok(c) => c,
-            Err(e) => {
-                eprintln!("Conversation insert error: {:?}", e);
-                return HttpResponse::InternalServerError().finish();
-            }
-        };
+    let conv = InsertConversation {
+        name,
+        admin: claims.username.clone(),
+        title: payload.title.clone(),
+    };
+
+    let conversation = match Conversation::insert(&mut *tx, &conv).await {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("Conversation insert error: {:?}", e);
+            return HttpResponse::InternalServerError().finish();
+        }
+    };
 
     // 2️⃣ Insert creator as participant
     if let Err(e) = PRepo::insert(&mut *tx, &conversation.name, &claims.username).await {
@@ -172,6 +192,80 @@ async fn get_conversation(
     }
 }
 
+#[get("/inbox/messages")]
+async fn get_pmessages(
+    state: web::Data<AppState>,
+    claims: web::ReqData<UserContext>,
+    query: web::Query<MessageFilters>,
+) -> impl Responder {
+    let query = query.into_inner();
+    let mbox = match get_default_mbox(&state.db, claims.username.clone()).await {
+        Ok(mb) => mb,
+        Err(e) => {
+            let ev: Vec<InsertMessage> = Vec::new();
+            return HttpResponse::Ok().json(ev);
+        }
+    };
+    let messages: Vec<InsertMessage> =
+        match repositories::Message::retrieve(&state.db, &mbox, query).await {
+            Ok(msgs) => msgs,
+            Err(e) => {
+                eprintln!("Error fetching messages: {:?}", e);
+                return HttpResponse::InternalServerError().finish();
+            }
+        };
+
+    let _messages = messages.clone();
+    let events: Vec<Receipt> = messages
+        .iter()
+        .map(|msg| Receipt {
+            message: msg.id.clone(),
+            user: claims.username.clone(),
+            delivered: true,
+            read: false,
+            reaction: None,
+        })
+        .collect();
+    for event in events {
+        let _ = state.workers.receipt_worker.send(event).await;
+    }
+    HttpResponse::Ok().json(messages)
+}
+
+#[post("/inbox/{peer}/messages")]
+async fn peer_message(
+    state: web::Data<AppState>,
+    claims: web::ReqData<UserContext>,
+    path: web::Path<String>,
+    payload: web::Json<CreateMessage>,
+) -> impl Responder {
+    let peer = path.into_inner();
+    let mbox = match get_default_mbox(&state.db, peer.clone()).await {
+        Ok(mb) => mb,
+        Err(e) => return HttpResponse::InternalServerError().body(e.to_string()),
+    };
+    let msg = InsertMessage {
+        source: claims.username.clone(),
+        mbox: mbox,
+        text: payload.text.clone(),
+        reply_to: payload.reply_to,
+        created: time_now(),
+        id: Uuid::new_v4().to_string(),
+    };
+    let _ = state.workers.msg_worker.send(msg.clone()).await;
+
+    let payload = match to_string(&msg) {
+        Ok(p) => p,
+        Err(e) => return HttpResponse::from_error(e),
+    };
+    state.chat_server.do_send(DeliverMessage {
+        to: peer,
+        payload: payload,
+        id: Uuid::new_v4().to_string(),
+    });
+    HttpResponse::Ok().finish()
+}
+
 #[post("/conversations/{name}/messages")]
 async fn post_message(
     state: web::Data<AppState>,
@@ -181,7 +275,7 @@ async fn post_message(
 ) -> impl Responder {
     let conversation_name = path.into_inner();
     // 1️⃣ Get participants from cache or fallback to DB
-    let participants: Vec<Participant> = PARTICIPANTS_CACHE
+    let participants: Vec<Participant> = match PARTICIPANTS_CACHE
         .get(&conversation_name, || async {
             // fallback closure if cache miss
             repositories::Participant::retrieve(&state.db, &conversation_name, 1000, 0)
@@ -189,7 +283,10 @@ async fn post_message(
                 .map_err(|e| CacheError::Fallback)
         })
         .await
-        .unwrap();
+    {
+        Ok(v) => v,
+        Err(_) => todo!(),
+    };
 
     if !participants
         .iter()
@@ -203,19 +300,14 @@ async fn post_message(
 
     let msg = InsertMessage {
         source: claims.username.clone(),
-        conversation: conversation_name,
+        mbox: conversation_name,
         text: payload.text.clone(),
         reply_to: payload.reply_to,
         created: time_now(),
         id: Uuid::new_v4().to_string(),
     };
-    //let _ = state.writer.send(msg.clone()).await;
-    let mut conn = state.redis.get_async_connection().await.unwrap();
-    let mss = to_string(&msg).unwrap();
-    let res: RedisResult<String> = conn.xadd("messages_stream", "*", &[("payload", mss)]).await;
-    if res.is_err() {
-        return HttpResponse::ServiceUnavailable().finish();
-    }
+
+    let _ = state.workers.msg_worker.send(msg.clone()).await;
     let source = msg.source.clone();
     let participant_ids: Vec<String> = participants
         .iter()
@@ -264,20 +356,9 @@ async fn get_messages(
             reaction: None,
         })
         .collect();
-    let redis = state.redis.clone();
-    rt::spawn(async move {
-        let mut conn = match redis.get_async_connection().await {
-            Ok(c) => c,
-            Err(_) => return,
-        };
-        for event in &events {
-            let payload = serde_json::to_string(&event).unwrap();
-
-            let _: redis::RedisResult<String> = conn
-                .xadd("receipts_stream", "*", &[("payload", payload)])
-                .await;
-        }
-    });
+    for event in events {
+        let _ = state.workers.receipt_worker.send(event).await;
+    }
     HttpResponse::Ok().json(messages)
 }
 
@@ -315,19 +396,7 @@ async fn react(
         read: false,
         reaction: Some(reaction),
     };
-    let redis = state.redis.clone();
-    rt::spawn(async move {
-        let mut conn = match redis.get_async_connection().await {
-            Ok(c) => c,
-            Err(_) => return,
-        };
-
-        let payload = serde_json::to_string(&event).unwrap();
-
-        let _: redis::RedisResult<String> = conn
-            .xadd("receipts_stream", "*", &[("payload", payload)])
-            .await;
-    });
+    let _ = state.workers.receipt_worker.send(event).await;
     HttpResponse::Ok()
 }
 
@@ -345,18 +414,6 @@ async fn mark_as_read(
         read: false,
         reaction: None,
     };
-    let redis = state.redis.clone();
-    rt::spawn(async move {
-        let mut conn = match redis.get_async_connection().await {
-            Ok(c) => c,
-            Err(_) => return,
-        };
-
-        let payload = serde_json::to_string(&event).unwrap();
-
-        let _: redis::RedisResult<String> = conn
-            .xadd("receipts_stream", "*", &[("payload", payload)])
-            .await;
-    });
+    let _ = state.workers.receipt_worker.send(event).await;
     HttpResponse::Ok()
 }
