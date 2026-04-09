@@ -8,7 +8,7 @@ class LoginFailed(Exception):
 class User:
     def __init__(self, username, password="password123") -> None:
         res = requests.post(
-            "http://localhost:8000/auth/login",
+            "http://localhost:8080/auth/auth/login",
             json={"username": username, "password": password},
             timeout=10,
         )
@@ -25,7 +25,7 @@ class User:
     @staticmethod
     def register(username, password="password123") -> bool:
         res = requests.post(
-            "http://localhost:8000/auth/register",
+            "http://localhost:8080/auth/auth/register",
             json={"username": username, "password": password},
             timeout=10,
         )

@@ -6,9 +6,8 @@ from json import loads
 from auth import User
 
 
-AUTH_BASE = "http://localhost/auth/auth"
-MSG_BASE = "http://127.0.0.1/messages"
-WS_URL = "ws://127.0.0.1/messages/ws/"
+MSG_BASE = "http://127.0.0.1:8080/messages"
+WS_URL = "ws://127.0.0.1:8080/messages/ws/"
 CONCURRENT_CONNECTIONS = 12
 # -----------------------------
 # Helpers
@@ -143,6 +142,7 @@ def ws_client(user: User, handler):
     ws = websocket.WebSocketApp(
         WS_URL,
         header={"Authorization": f"Bearer {user.access}"},
+        on_error=print,
         on_message=on_message,
         on_open=on_connect,
     )
